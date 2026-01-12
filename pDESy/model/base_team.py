@@ -178,6 +178,10 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
         # Advanced parameters for customized simulation
         quality_skill_mean_map: dict[str, float] = None,
         quality_skill_sd_map: dict[str, float] = None,
+        # Labor regulation parameters
+        daily_work_step_limit: int = None,
+        weekly_work_step_limit: int = None,
+        min_continuous_rest_steps: int = None,
     ):
         """
         Create a BaseWorker instance and add it to this team.
@@ -199,6 +203,9 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
             assigned_task_facility_id_tuple_set_record_list (List[set(tuple(str, str))], optional): Record of his or her assigned tasks' id in simulation. Defaults to None -> [].
             quality_skill_mean_map (Dict[str, float], optional): Skill for expressing quality in unit time. Defaults to None -> {}.
             quality_skill_sd_map (Dict[str, float], optional): Standard deviation of skill for expressing quality in unit time. Defaults to None -> {}.
+            daily_work_step_limit (int, optional): Maximum working steps per day. Defaults to None.
+            weekly_work_step_limit (int, optional): Maximum working steps per week. Defaults to None.
+            min_continuous_rest_steps (int, optional): Minimum continuous rest steps required. Defaults to None.
 
         Returns:
             BaseWorker: The created worker.
@@ -225,6 +232,10 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
             # Advanced parameters for customized simulation
             quality_skill_mean_map=quality_skill_mean_map,
             quality_skill_sd_map=quality_skill_sd_map,
+            # Labor regulation parameters
+            daily_work_step_limit=daily_work_step_limit,
+            weekly_work_step_limit=weekly_work_step_limit,
+            min_continuous_rest_steps=min_continuous_rest_steps,
         )
         self.add_worker(worker)
         return worker
@@ -361,6 +372,10 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
                 assigned_task_facility_id_tuple_set_record_list=w[
                     "assigned_task_facility_id_tuple_set_record_list"
                 ],
+                # Labor regulation parameters
+                daily_work_step_limit=w.get("daily_work_step_limit"),
+                weekly_work_step_limit=w.get("weekly_work_step_limit"),
+                min_continuous_rest_steps=w.get("min_continuous_rest_steps"),
             )
             self.worker_set.add(worker)
         self.targeted_task_id_set = set(json_data["targeted_task_id_set"])
