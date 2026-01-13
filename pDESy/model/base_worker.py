@@ -48,9 +48,9 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         assigned_task_facility_id_tuple_set_record_list (List[set(tuple(str, str))], optional): Record of assigned tasks' id in simulation. Defaults to None -> [].
         quality_skill_mean_map (Dict[str, float], optional): Skill for expressing quality in unit time. Defaults to None -> {}.
         quality_skill_sd_map (Dict[str, float], optional): Standard deviation of skill for expressing quality in unit time. Defaults to None -> {}.
-        daily_work_step_limit (int, optional): Maximum working steps per day (e.g., 14 for 14 hours if 1 step = 1 hour). Defaults to None.
-        weekly_work_step_limit (int, optional): Maximum working steps per week (e.g., 72 for 72 hours if 1 step = 1 hour). Defaults to None.
-        min_continuous_rest_steps (int, optional): Minimum continuous rest steps required (e.g., 10 for 10 hours if 1 step = 1 hour). Defaults to None.
+        work_limit_list (List[tuple[int, int]], optional): List of work limit constraints. Each tuple is (observation_period_steps, max_work_steps). Defaults to None.
+            Example: [(24, 14), (168, 72)] means within 24 steps max 14 work steps, within 168 steps max 72 work steps.
+        min_continuous_rest_steps (int, optional): Minimum continuous rest steps required before resuming work. Defaults to None.
     """
 
     def __init__(
@@ -78,8 +78,7 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         quality_skill_mean_map: dict[str, float] = None,
         quality_skill_sd_map: dict[str, float] = None,
         # Labor regulation parameters
-        daily_work_step_limit: int = None,
-        weekly_work_step_limit: int = None,
+        work_limit_list: list[tuple[int, int]] = None,
         min_continuous_rest_steps: int = None,
     ):
         """init."""
@@ -118,8 +117,7 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         self.quality_skill_sd_map = quality_skill_sd_map or {}
         # --
         # Labor regulation parameters
-        self.daily_work_step_limit = daily_work_step_limit
-        self.weekly_work_step_limit = weekly_work_step_limit
+        self.work_limit_list = work_limit_list or []
         self.min_continuous_rest_steps = min_continuous_rest_steps
 
     def has_facility_skill(self, facility_name: str, error_tol: float = 1e-10):
@@ -187,8 +185,10 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         Check labor regulation constraints (returns True if violation = cannot work).
 
         This method checks:
-        1. Weekly work limit: Total working steps in the last week (168 steps assuming 1 step = 1 hour)
-        2. Daily work limit with rest interval: Working steps since last sufficient continuous rest
+        1. Work limit constraints: For each (observation_period, max_work) in work_limit_list,
+           checks if working steps in the last observation_period steps exceeds max_work.
+        2. Continuous rest requirement: Working steps since last sufficient continuous rest
+           must not exceed the limit defined by work_limit_list.
 
         Args:
             current_time (int): Current simulation step time.
@@ -201,50 +201,55 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
 
         history = self.state_record_list
 
-        # --- A. Weekly Limit Check ---
-        if self.weekly_work_step_limit is not None:
-            # Look back 168 steps (1 week assuming 1 step = 1 hour)
-            lookback_window = 168
-            start_index = max(0, len(history) - lookback_window)
+        # --- A. Work Limit Check ---
+        # Check each constraint in work_limit_list
+        for observation_period, max_work_steps in self.work_limit_list:
+            start_index = max(0, len(history) - observation_period)
             recent_states = history[start_index:]
-            weekly_work_steps = sum(
+            work_steps = sum(
                 1 for s in recent_states if s == BaseWorkerState.WORKING
             )
 
-            if weekly_work_steps >= self.weekly_work_step_limit:
+            if work_steps >= max_work_steps:
                 return True
 
-        # --- B. Daily Limit & Rest Interval Check ---
-        if (
-            self.daily_work_step_limit is not None
-            and self.min_continuous_rest_steps is not None
-        ):
-            # Find the end position of last sufficient continuous rest
-            last_long_rest_end_index = 0
-            consecutive_rest_count = 0
+        # --- B. Continuous Rest Requirement Check ---
+        # This checks if worker has had sufficient rest before working again
+        if self.min_continuous_rest_steps is not None and self.work_limit_list:
+            # Get the smallest observation period's max work limit for daily limit check
+            # Find the work limit with the smallest observation period
+            if self.work_limit_list:
+                smallest_period_limit = min(
+                    self.work_limit_list, key=lambda x: x[0]
+                )
+                daily_work_limit = smallest_period_limit[1]
 
-            for i in range(len(history) - 1, -1, -1):
-                if history[i] != BaseWorkerState.WORKING:  # FREE or ABSENCE
-                    consecutive_rest_count += 1
+                # Find the end position of last sufficient continuous rest
+                last_long_rest_end_index = 0
+                consecutive_rest_count = 0
+
+                for i in range(len(history) - 1, -1, -1):
+                    if history[i] != BaseWorkerState.WORKING:  # FREE or ABSENCE
+                        consecutive_rest_count += 1
+                    else:
+                        # Check if sufficient rest was completed before this WORKING state
+                        if consecutive_rest_count >= self.min_continuous_rest_steps:
+                            last_long_rest_end_index = i + 1 + consecutive_rest_count
+                            break
+                        consecutive_rest_count = 0
                 else:
-                    # Check if sufficient rest was completed before this WORKING state
+                    # Loop completed without break (checked all history)
                     if consecutive_rest_count >= self.min_continuous_rest_steps:
-                        last_long_rest_end_index = i + 1 + consecutive_rest_count
-                        break
-                    consecutive_rest_count = 0
-            else:
-                # Loop completed without break (checked all history)
-                if consecutive_rest_count >= self.min_continuous_rest_steps:
-                    last_long_rest_end_index = consecutive_rest_count
+                        last_long_rest_end_index = consecutive_rest_count
 
-            # Calculate working steps since last sufficient rest
-            work_since_last_rest = history[last_long_rest_end_index:]
-            daily_work_steps = sum(
-                1 for s in work_since_last_rest if s == BaseWorkerState.WORKING
-            )
+                # Calculate working steps since last sufficient rest
+                work_since_last_rest = history[last_long_rest_end_index:]
+                work_steps_since_rest = sum(
+                    1 for s in work_since_last_rest if s == BaseWorkerState.WORKING
+                )
 
-            if daily_work_steps >= self.daily_work_step_limit:
-                return True
+                if work_steps_since_rest >= daily_work_limit:
+                    return True
 
         return False
 
@@ -557,8 +562,7 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
             assigned_task_facility_id_tuple_set=assigned_current,
             assigned_task_facility_id_tuple_set_record_list=assigned_history,
             # Labor regulation parameters
-            daily_work_step_limit=self.daily_work_step_limit,
-            weekly_work_step_limit=self.weekly_work_step_limit,
+            work_limit_list=self.work_limit_list,
             min_continuous_rest_steps=self.min_continuous_rest_steps,
         )
         return dict_json_data
