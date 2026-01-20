@@ -178,6 +178,8 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
         # Advanced parameters for customized simulation
         quality_skill_mean_map: dict[str, float] = None,
         quality_skill_sd_map: dict[str, float] = None,
+        work_constraint_list: list = None,
+        rest_constraint_list: list = None,
     ):
         """
         Create a BaseWorker instance and add it to this team.
@@ -225,6 +227,8 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
             # Advanced parameters for customized simulation
             quality_skill_mean_map=quality_skill_mean_map,
             quality_skill_sd_map=quality_skill_sd_map,
+            work_constraint_list=work_constraint_list,
+            rest_constraint_list=rest_constraint_list,
         )
         self.add_worker(worker)
         return worker
