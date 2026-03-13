@@ -743,6 +743,41 @@ class BaseProject(object, metaclass=ABCMeta):
                     for workplace in self.workplace_set:
                         workplace.set_absence_state_to_all_facilities()
 
+                # =================================================================
+                # 【追加実装】 Preemption: 不在(ABSENCE)になったWorkerのタスク・設備解放処理
+                # =================================================================
+                for team in self.team_set:
+                    for worker in team.worker_set:
+                        # 作業者が ABSENCE（不在）かつ、タスクを持っている場合
+                        if (worker.state == BaseWorkerState.ABSENCE) and (len(worker.assigned_task_facility_id_tuple_set) > 0):
+                            
+                            # ループ中にリストを変更するため、コピーを作成して回す
+                            assigned_pairs = list(worker.assigned_task_facility_id_tuple_set)
+                            
+                            for task_id, facility_id in assigned_pairs:
+                                task = self.task_dict.get(task_id)
+                                facility = self.facility_dict.get(facility_id)
+                                
+                                # 1. Workerから割り当て情報を削除
+                                worker.remove_assigned_pair((task_id, facility_id))
+                                
+                                # 2. Taskから割り当て情報を削除
+                                if task is not None:
+                                    task.remove_alloc_pair((worker.ID, facility_id))
+                                    
+                                    # タスクに誰も割り当てられていなければ READY に戻す
+                                    if len(task.allocated_worker_facility_id_tuple_set) == 0:
+                                        task.state = BaseTaskState.READY
+                                
+                                # 3. Facilityから割り当て情報を削除 & 解放
+                                if facility is not None:
+                                    facility.remove_assigned_pair((task_id, worker.ID))
+                                    
+                                    # 設備が他のタスク/人に使われていなければ FREE に戻す
+                                    if len(facility.assigned_task_worker_id_tuple_set) == 0:
+                                        facility.state = BaseFacilityState.FREE
+                # =================================================================
+
                 # 2. Allocate free workers to READY tasks
                 if working:
                     self.__allocate(
