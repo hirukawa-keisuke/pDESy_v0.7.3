@@ -74,6 +74,9 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         # Advanced parameters for customized simulation
         quality_skill_mean_map: dict[str, float] = None,
         quality_skill_sd_map: dict[str, float] = None,
+        # Labpr regulations
+        work_constraint_list: list = None,
+        rest_constraint_list: list = None,
     ):
         """init."""
         # ----
@@ -109,6 +112,17 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         # Advanced parameter for customized simulation
         self.quality_skill_mean_map = quality_skill_mean_map or {}
         self.quality_skill_sd_map = quality_skill_sd_map or {}
+        # --
+        # work_constraint_list: [(Window, Limit, Type), ...]
+        self.work_constraint_list = []
+        if work_constraint_list is not None:
+            # 入力をそのまま保持する運用とします
+            self.work_constraint_list = work_constraint_list
+
+        # rest_constraint_list: [(Window, MinContinuousRest), ...]
+        self.rest_constraint_list = []
+        if rest_constraint_list is not None:
+            self.rest_constraint_list = rest_constraint_list
 
     def has_facility_skill(self, facility_name: str, error_tol: float = 1e-10):
         """
@@ -170,6 +184,90 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         base_quality = np.random.normal(skill_mean, skill_sd)
         return base_quality  # / float(sum_of_working_task_in_this_time)
 
+    # 【追加】制約チェックのメイン関数
+    def check_simulation_constraints(self, step_time: int):
+        """
+        Check labor constraints.
+        Returns True if the worker must be ABSENCE due to constraints.
+        """
+        
+        # 1. 労働時間制約 (Fixed & Sliding)
+        for constraint in self.work_constraint_list:
+            # デフォルト値の設定
+            window = constraint[0]
+            limit = constraint[1]
+            c_type = "SLIDING" # デフォルト
+            if len(constraint) > 2:
+                c_type = constraint[2]
+
+            if c_type.upper() == "FIXED":
+                if self._check_fixed_work_limit(step_time, window, limit):
+                    return True
+            else:
+                # SLIDING
+                if self._check_sliding_work_limit(step_time, window, limit):
+                    return True
+
+        # 2. 休憩制約 (連続ブロックチェックのみ)
+        for constraint in self.rest_constraint_list:
+            window = constraint[0]
+            min_continuous = constraint[1]
+            
+            if self._check_continuous_rest_limit(step_time, window, min_continuous):
+                return True
+
+        return False
+
+    # 【追加】Helper関数: 固定窓（Fixed Window）チェック
+    def _check_fixed_work_limit(self, step_time: int, interval: int, limit: int):
+        # 区間の開始位置を計算 (例: 0-23, 24-47...)
+        current_period_id = step_time // interval
+        start_step = current_period_id * interval
+        
+        # 履歴取得 (区間開始 〜 現在)
+        history = self.state_record_list[start_step:step_time]
+        current_work = history.count(BaseWorkerState.WORKING)
+        
+        # 今回働くと上限を超えるか
+        return (current_work + 1) > limit
+
+    # 【追加】Helper関数: スライディング窓（Sliding Window）チェック
+    def _check_sliding_work_limit(self, step_time: int, window: int, limit: int):
+        start_step = max(0, step_time - window + 1)
+        history = self.state_record_list[start_step:step_time]
+        current_work = history.count(BaseWorkerState.WORKING)
+        
+        # 今回働くと上限を超えるか
+        return (current_work + 1) > limit
+
+    # 【追加】Helper関数: 連続休憩（Continuous Rest）チェック
+    def _check_continuous_rest_limit(self, step_time: int, window: int, min_continuous: int):
+        start_step = max(0, step_time - window + 1)
+        recent_states = self.state_record_list[start_step:step_time]
+        
+        # 「今回働いた」と仮定したシーケンスを作成
+        test_sequence = recent_states + [BaseWorkerState.WORKING]
+        
+        # 過去分が足りない場合はFREEで埋める
+        missing = window - len(test_sequence)
+        if missing > 0:
+            test_sequence = [BaseWorkerState.FREE] * missing + test_sequence
+            
+        # 連続休憩ブロックを探す
+        max_rest_block = 0
+        current_run = 0
+        for s in test_sequence:
+            if s != BaseWorkerState.WORKING:
+                current_run += 1
+            else:
+                max_rest_block = max(max_rest_block, current_run)
+                current_run = 0
+        # ループ後の残りチェック
+        max_rest_block = max(max_rest_block, current_run)
+
+        # 指定された長さ以上の休憩ブロックが一つもなければ違反
+        return max_rest_block < min_continuous
+    
     def check_update_state_from_absence_time_list(self, step_time: int):
         """
         Check and update state of all resources to ABSENCE, FREE, or WORKING.
@@ -180,6 +278,11 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         if step_time in self.absence_time_list:
             self.state = BaseWorkerState.ABSENCE
             return
+        # 制約違反なら強制的にABSENCE
+        if self.check_simulation_constraints(step_time):
+            self.state = BaseWorkerState.ABSENCE
+            return
+        
         assigned = self.assigned_task_facility_id_tuple_set
         self.state = BaseWorkerState.FREE if not assigned else BaseWorkerState.WORKING
 
@@ -470,6 +573,8 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
             cost_record_list=self.cost_record_list,
             assigned_task_facility_id_tuple_set=assigned_current,
             assigned_task_facility_id_tuple_set_record_list=assigned_history,
+            work_constraint_list=self.work_constraint_list,
+            rest_constraint_list=self.rest_constraint_list,
         )
         return dict_json_data
 
