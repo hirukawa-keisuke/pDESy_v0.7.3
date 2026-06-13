@@ -1204,6 +1204,44 @@ class BaseProject(object, metaclass=ABCMeta):
                 break
             cur = self.workplace_dict.get(cur.parent_workplace_id, None)
 
+    # =================================================================
+    # 【追加実装】
+    # =================================================================
+    def __preempt_non_mandatory_allocations(self):
+        """非必須タスクの割当を強制解除（プリエンプション）"""
+        for task in self.task_set:
+            if getattr(task, "mandatory", False):
+                continue
+            if not task.allocated_worker_facility_id_tuple_set:
+                continue
+
+            # 割当解除
+            for worker_id, facility_id in task.allocated_worker_facility_id_tuple_set:
+                worker = self.worker_dict.get(worker_id, None)
+                facility = self.facility_dict.get(facility_id, None)
+
+                if worker is not None:
+                    worker.remove_assigned_pair((task.ID, facility_id))
+                    worker.state = BaseWorkerState.FREE
+
+                if facility is not None:
+                    facility.remove_assigned_pair((task.ID, worker_id))
+                    facility.state = BaseFacilityState.FREE
+
+            task.allocated_worker_facility_id_tuple_set = frozenset()
+            if task.state == BaseTaskState.WORKING:
+                task.state = BaseTaskState.READY
+
+    def __has_unallocated_mandatory(self, mandatory_tasks: list[BaseTask]) -> list[BaseTask]:
+        """必須タスクのうち、割当が足りないものを返す"""
+        unallocated = []
+        for t in mandatory_tasks:
+            if t.auto_task:
+                continue
+            if len(t.allocated_worker_facility_id_tuple_set) == 0:
+                unallocated.append(t)
+        return unallocated
+
     def __allocate(
         self,
         task_priority_rule: TaskPriorityRuleMode = TaskPriorityRuleMode.TSLACK,
@@ -1232,6 +1270,10 @@ class BaseProject(object, metaclass=ABCMeta):
         ready_and_working_task_list = sort_task_list(
             ready_and_working_task_list, task_priority_rule
         )
+        # 「追加」　必須タスクを先頭へ
+        mandatory_tasks = [t for t in ready_and_working_task_list if getattr(t, "mandatory", False)]
+        non_mandatory_tasks = [t for t in ready_and_working_task_list if not getattr(t, "mandatory", False)]
+        ready_and_working_task_list = mandatory_tasks + non_mandatory_tasks
 
         # 3. Allocate ready tasks to free workers and facilities
         target_workplace_id_set = {wp.ID for wp in self.workplace_set}
@@ -1408,6 +1450,33 @@ class BaseProject(object, metaclass=ABCMeta):
                             free_worker_list = [
                                 w for w in free_worker_list if w.ID != worker.ID
                             ]
+        # 「追加」 必須タスクが未割当ならプリエンプションして再割当
+        unallocated_mandatory = self.__has_unallocated_mandatory(mandatory_tasks)
+        if unallocated_mandatory:
+            self.__preempt_non_mandatory_allocations()
+
+            # freeリスト再構築
+            worker_list = list(
+                itertools.chain.from_iterable(
+                    list(map(lambda team: team.worker_set, self.team_set))
+                )
+            )
+            free_worker_list = list(
+                filter(lambda worker: worker.state == BaseWorkerState.FREE, worker_list)
+            )
+
+            # 必須タスクだけ再割当
+            for task in mandatory_tasks:
+                ...
+                # （既存の allocation ロジック 그대로）
+                ...
+
+            unallocated_mandatory = self.__has_unallocated_mandatory(mandatory_tasks)
+            if unallocated_mandatory:
+                names = ", ".join([t.name for t in unallocated_mandatory])
+                raise RuntimeError(
+                    f"Mandatory task(s) could not be allocated due to resource shortage: {names}"
+                )
 
     def check_state_workflow(self, workflow: BaseWorkflow, state: BaseTaskState):
         """

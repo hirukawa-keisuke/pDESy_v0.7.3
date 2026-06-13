@@ -49,6 +49,7 @@ class BaseSubProjectTask(BaseTask):
         default_progress: float = None,
         due_time: float = None,
         auto_task: bool = True,
+        mandatory: bool = False,  # 追加
         fixing_allocating_worker_id_set: set = None,
         fixing_allocating_facility_id_set: set = None,
         # Basic variables
@@ -132,6 +133,7 @@ class BaseSubProjectTask(BaseTask):
             default_progress=default_progress,
             due_time=due_time,
             auto_task=auto_task,
+            mandatory=mandatory,  # 追加
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
