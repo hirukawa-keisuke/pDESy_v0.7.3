@@ -657,6 +657,8 @@ class BaseProject(object, metaclass=ABCMeta):
         max_time: int = 10000,
         unit_time: int = 1,
         progress_bar: bool = False,
+        worker_standby_gap_steps: int = 0,
+        standby_counts_as_labor_cost: bool = True,
     ):
         """
         Simulate this BaseProject.
@@ -680,9 +682,24 @@ class BaseProject(object, metaclass=ABCMeta):
                 Unit time of simulation. Defaults to 1.
             progress_bar (bool, optional):
                 Whether to show progress bar during simulation. Defaults to False.
+            worker_standby_gap_steps (int, optional):
+                Maximum number of consecutive FREE record steps between two working
+                allocations that should be reclassified as WORKING standby time.
+                ABSENCE records are never bridged. Set 0 to disable. Defaults to 0.
+            standby_counts_as_labor_cost (bool, optional):
+                Whether reclassified standby steps should also be added to worker,
+                team, and project labor-cost histories. Defaults to True.
         """
         if absence_time_list is None:
             absence_time_list = []
+
+        if worker_standby_gap_steps < 0:
+            raise ValueError("worker_standby_gap_steps must be greater than or equal to 0")
+
+        # __allocate() is private and called from this simulation loop, so keep the
+        # standby policy on the project while the simulation is running.
+        self._worker_standby_gap_steps = int(worker_standby_gap_steps)
+        self._standby_counts_as_labor_cost = bool(standby_counts_as_labor_cost)
 
         self.initialize(state_info=initialize_state_info, log_info=initialize_log_info)
 
@@ -1140,6 +1157,106 @@ class BaseProject(object, metaclass=ABCMeta):
         for product in self.product_set:
             product.record(working)
 
+    def __get_worker_short_free_gap_step_list(self, worker: BaseWorker):
+        """Return a trailing FREE gap that can be treated as standby."""
+        max_gap_steps = getattr(self, "_worker_standby_gap_steps", 0)
+        if max_gap_steps <= 0:
+            return []
+
+        state_record_list = worker.state_record_list
+        if not state_record_list:
+            return []
+
+        gap_step_list = []
+        step = len(state_record_list) - 1
+
+        # Inspect only the trailing FREE run. Stop as soon as the threshold is
+        # exceeded so a long break is never converted into standby.
+        while step >= 0 and state_record_list[step] == BaseWorkerState.FREE:
+            gap_step_list.append(step)
+            if len(gap_step_list) > max_gap_steps:
+                return []
+            step -= 1
+
+        if not gap_step_list:
+            return []
+
+        # Do not bridge the beginning of the simulation or an ABSENCE period.
+        if step < 0 or state_record_list[step] != BaseWorkerState.WORKING:
+            return []
+
+        return gap_step_list
+
+    def __can_allocate_worker_with_standby(self, worker: BaseWorker):
+        """Check labor constraints against a prospective standby-filled history.
+
+        ``BaseWorker.check_simulation_constraints()`` assumes that the current
+        step will be WORKING. Temporarily replacing the short trailing FREE gap
+        with WORKING therefore checks both the standby gap and the task about to
+        be allocated. The worker's real history is restored before returning.
+        """
+        gap_step_list = self.__get_worker_short_free_gap_step_list(worker)
+        if not gap_step_list:
+            return True
+
+        constraint_checker = getattr(worker, "check_simulation_constraints", None)
+        if constraint_checker is None:
+            return True
+
+        original_state_record_list = worker.state_record_list
+        prospective_state_record_list = original_state_record_list.copy()
+        for standby_step in gap_step_list:
+            prospective_state_record_list[standby_step] = BaseWorkerState.WORKING
+
+        worker.state_record_list = prospective_state_record_list
+        try:
+            violates_constraints = constraint_checker(self.time)
+        finally:
+            worker.state_record_list = original_state_record_list
+
+        return not violates_constraints
+
+    def __fill_worker_short_free_gap_as_standby(self, worker: BaseWorker):
+        """Reclassify a validated short trailing FREE gap as WORKING standby.
+
+        This method is called immediately before ``worker`` receives a new task.
+        Therefore, a trailing FREE sequence in the existing history is known to be
+        bounded by real work on both sides: the previous WORKING record and the new
+        allocation about to start. Gaps longer than the configured threshold and
+        gaps containing ABSENCE are left unchanged.
+
+        Task-assignment history is intentionally not changed. A step whose worker
+        state is WORKING but whose assigned-task set is empty represents standby.
+        """
+        gap_step_list = self.__get_worker_short_free_gap_step_list(worker)
+        if not gap_step_list:
+            return
+
+        team = self.team_dict.get(worker.team_id, None)
+        add_labor_cost = getattr(self, "_standby_counts_as_labor_cost", True)
+
+        for standby_step in gap_step_list:
+            worker.state_record_list[standby_step] = BaseWorkerState.WORKING
+
+            if not add_labor_cost:
+                continue
+
+            # add_labor_cost() has already recorded zero for a FREE worker at this
+            # past step. Replace it with the normal per-step labor cost and apply
+            # the same delta to the aggregate team/project histories.
+            if standby_step >= len(worker.cost_record_list):
+                continue
+
+            previous_cost = worker.cost_record_list[standby_step]
+            standby_cost = worker.cost_per_time
+            cost_delta = standby_cost - previous_cost
+            worker.cost_record_list[standby_step] = standby_cost
+
+            if team is not None and standby_step < len(team.cost_record_list):
+                team.cost_record_list[standby_step] += cost_delta
+            if standby_step < len(self.cost_record_list):
+                self.cost_record_list[standby_step] += cost_delta
+
     def __update(self):
         for workflow in self.workflow_set:
             self.check_state_workflow(workflow, BaseTaskState.FINISHED)
@@ -1204,12 +1321,96 @@ class BaseProject(object, metaclass=ABCMeta):
                 break
             cur = self.workplace_dict.get(cur.parent_workplace_id, None)
 
+    # =================================================================
+    # 【追加実装】
+    # =================================================================
+    # def __preempt_non_mandatory_allocations(self):
+    #     """非必須タスクの割当を強制解除（プリエンプション）"""
+    #     for task in self.task_set:
+    #         if getattr(task, "mandatory", False):
+    #             continue
+    #         if not task.allocated_worker_facility_id_tuple_set:
+    #             continue
+
+    #         # 割当解除
+    #         for worker_id, facility_id in task.allocated_worker_facility_id_tuple_set:
+    #             worker = self.worker_dict.get(worker_id, None)
+    #             facility = self.facility_dict.get(facility_id, None)
+
+    #             if worker is not None:
+    #                 worker.remove_assigned_pair((task.ID, facility_id))
+    #                 worker.state = BaseWorkerState.FREE
+
+    #             if facility is not None:
+    #                 facility.remove_assigned_pair((task.ID, worker_id))
+    #                 facility.state = BaseFacilityState.FREE
+
+    #         task.allocated_worker_facility_id_tuple_set = frozenset()
+    #         if task.state == BaseTaskState.WORKING:
+    #             task.state = BaseTaskState.READY
+
+    def __has_unallocated_mandatory(self, mandatory_tasks: list[BaseTask]) -> list[BaseTask]:
+        """必須タスクのうち、割当が足りないものを返す"""
+        unallocated = []
+        for t in mandatory_tasks:
+            if t.auto_task:
+                continue
+            if len(t.allocated_worker_facility_id_tuple_set) == 0:
+                unallocated.append(t)
+        return unallocated
+
+    def __preempt_non_mandatory_allocations(self):
+        """非必須タスクを中断してリソースを解放し、READY状態に戻す"""
+        for task in self.task_set:
+            if not getattr(task, "mandatory", False):
+                # すでに割り当てがある場合（WORKING、あるいはREADYで割り当て済み）
+                if len(task.allocated_worker_facility_id_tuple_set) > 0:
+                    
+                    # イテレート中の変更を避けるためリスト化して回す
+                    assigned_pairs = list(task.allocated_worker_facility_id_tuple_set)
+                    for w_id, f_id in assigned_pairs:
+                        worker = self.worker_dict.get(w_id)
+                        facility = self.facility_dict.get(f_id) if f_id else None
+
+                        # 1. Workerから割り当て情報を削除してFREEに戻す
+                        if worker is not None:
+                            worker.remove_assigned_pair((task.ID, f_id))
+                            if len(worker.assigned_task_facility_id_tuple_set) == 0:
+                                worker.state = BaseWorkerState.FREE
+
+                        # 2. Facilityから割り当て情報を削除してFREEに戻す
+                        if facility is not None:
+                            facility.remove_assigned_pair((task.ID, w_id))
+                            if len(facility.assigned_task_worker_id_tuple_set) == 0:
+                                facility.state = BaseFacilityState.FREE
+
+                        # 3. Taskから割り当て情報を削除
+                        task.remove_alloc_pair((w_id, f_id))
+
+                    # 誰もいなくなったらタスクの進行を止めて READY に戻す
+                    if len(task.allocated_worker_facility_id_tuple_set) == 0:
+                        task.state = BaseTaskState.READY
+
     def __allocate(
         self,
         task_priority_rule: TaskPriorityRuleMode = TaskPriorityRuleMode.TSLACK,
     ):
+        # =================================================================
+        # 0. 【プリエンプション・フェーズ】
+        # 必須タスクがREADYで待機しているかチェックし、待機しているなら
+        # 優先度の低い非必須タスクから一旦リソースを剥がしてFREEにする
+        # =================================================================
+        mandatory_ready_tasks = [
+            t for t in self.task_set 
+            if getattr(t, "mandatory", False) and t.state == BaseTaskState.READY
+        ]
+        if len(mandatory_ready_tasks) > 0:
+            self.__preempt_non_mandatory_allocations()
 
-        # 1. Get ready task and free workers and facilities
+
+        # =================================================================
+        # 1. 割り当て対象のタスクと、FREEなワーカーの取得
+        # =================================================================
         ready_and_working_task_list = list(
             filter(
                 lambda task: task.state == BaseTaskState.READY
@@ -1224,21 +1425,35 @@ class BaseProject(object, metaclass=ABCMeta):
             )
         )
 
+        # 事前にプリエンプションしたことで、ここで取得される free_worker_list が増えている
         free_worker_list = list(
             filter(lambda worker: worker.state == BaseWorkerState.FREE, worker_list)
         )
 
-        # 2. Sort ready task using TaskPriorityRule
+
+        # =================================================================
+        # 2. タスクの優先度ソート（必須タスクを最優先に）
+        # =================================================================
         ready_and_working_task_list = sort_task_list(
             ready_and_working_task_list, task_priority_rule
         )
+        
+        mandatory_tasks = [t for t in ready_and_working_task_list if getattr(t, "mandatory", False)]
+        non_mandatory_tasks = [t for t in ready_and_working_task_list if not getattr(t, "mandatory", False)]
+        
+        # 必須タスク -> 非必須タスク の順に並べる
+        ready_and_working_task_list = mandatory_tasks + non_mandatory_tasks
 
-        # 3. Allocate ready tasks to free workers and facilities
+
+        # =================================================================
+        # 3. 実際の割り当て処理（ループは1回のみ！）
+        # =================================================================
         target_workplace_id_set = {wp.ID for wp in self.workplace_set}
 
         for task in ready_and_working_task_list:
+            
+            # --- 設備・コンポーネント関連の配置ロジック ---
             if task.target_component_id is not None:
-                # 3-1. Set target component of workplace if target component is ready
                 component = self.component_dict.get(task.target_component_id, None)
                 if self.is_ready_component(component):
                     candidate_workplace_set = [
@@ -1259,10 +1474,7 @@ class BaseProject(object, metaclass=ABCMeta):
                                     conveyor_condition = True
                                 elif not (
                                     component.placed_workplace_id
-                                    in [
-                                        workplace_id
-                                        for workplace_id in workplace.input_workplace_id_set
-                                    ]
+                                    in [wp_id for wp_id in workplace.input_workplace_id_set]
                                 ):
                                     conveyor_condition = False
 
@@ -1270,92 +1482,61 @@ class BaseProject(object, metaclass=ABCMeta):
                                 workplace.get_total_workamount_skill(task.name) > 1e-10
                             )
                             if task.auto_task:
-                                # Auto task can be performed even if there is no skill
                                 skill_flag = True
 
                             if (
                                 conveyor_condition
-                                and self.can_put_component_to_workplace(
-                                    workplace, component
-                                )
+                                and self.can_put_component_to_workplace(workplace, component)
                                 and skill_flag
                             ):
-                                # 3-1-1. move ready_component
                                 pre_workplace = self.workplace_dict.get(
                                     component.placed_workplace_id, None
                                 )
 
-                                # 3-1-1-1. remove
                                 if pre_workplace is None:
                                     for child_c_id in component.child_component_id_set:
-                                        child_c = self.component_dict.get(
-                                            child_c_id, None
-                                        )
-                                        wp = self.workplace_dict.get(
-                                            child_c.placed_workplace_id, None
-                                        )
+                                        child_c = self.component_dict.get(child_c_id, None)
+                                        wp = self.workplace_dict.get(child_c.placed_workplace_id, None)
                                         if wp is not None:
                                             for c_wp_id in wp.placed_component_id_set:
-                                                c_wp = self.component_dict.get(
-                                                    c_wp_id, None
-                                                )
+                                                c_wp = self.component_dict.get(c_wp_id, None)
                                                 if any(
                                                     child_id == task.target_component_id
                                                     for child_id in c_wp.child_component_id_set
                                                 ):
-                                                    self.remove_component_on_workplace(
-                                                        c_wp, wp
-                                                    )
-
+                                                    self.remove_component_on_workplace(c_wp, wp)
                                 elif pre_workplace is not None:
-                                    self.remove_component_on_workplace(
-                                        component, pre_workplace
-                                    )
+                                    self.remove_component_on_workplace(component, pre_workplace)
 
                                 self.set_component_on_workplace(component, None)
-
-                                # 3-1-1-2. register
                                 self.set_component_on_workplace(component, workplace)
                                 break
 
+            # --- ワーカーおよび設備の割り当てロジック ---
             if not task.auto_task:
-                # 3-2. Allocate ready tasks to free workers and facilities
-
                 if task.need_facility:
-                    # Search candidate facilities from the list of placed_workplace
-                    target_component = self.component_dict.get(
-                        task.target_component_id, None
-                    )
-                    placed_workplace = self.workplace_dict.get(
-                        target_component.placed_workplace_id, None
-                    )
+                    target_component = self.component_dict.get(task.target_component_id, None)
+                    placed_workplace = self.workplace_dict.get(target_component.placed_workplace_id, None)
 
                     if placed_workplace is not None:
-                        # Facility candidate set
                         candidate_facility_set = set()
                         for wp in self.__iter_workplace_and_ancestors(placed_workplace):
                             candidate_facility_set.update(wp.facility_set)
                         free_facility_list = [
                             f for f in candidate_facility_set if f.state == BaseFacilityState.FREE
                         ]
-
-                        # Facility sorting
-                        free_facility_list = sort_facility_list(
-                            free_facility_list, task.facility_priority_rule
-                        )
-
-                        # Extract only candidate facilities
+                        free_facility_list = sort_facility_list(free_facility_list, task.facility_priority_rule)
                         allocating_facilities = [
                             f for f in free_facility_list if f.has_workamount_skill(task.name)
                         ]
 
                         for facility in allocating_facilities:
-                            # Extract only candidate workers
                             allocating_workers = list(
                                 filter(
                                     lambda worker, task=task, facility=facility: (
                                         worker.has_workamount_skill(task.name)
                                         and self.__is_allocated_worker(worker, task)
+                                        and self.__can_allocate_worker_with_standby(worker)
                                         and self.can_add_resources_to_task(
                                             task, worker=worker, facility=facility
                                         )
@@ -1363,8 +1544,6 @@ class BaseProject(object, metaclass=ABCMeta):
                                     free_worker_list,
                                 )
                             )
-
-                            # Sort workers
                             allocating_workers = sort_worker_list(
                                 allocating_workers,
                                 task.worker_priority_rule,
@@ -1372,42 +1551,48 @@ class BaseProject(object, metaclass=ABCMeta):
                                 workplace_id=placed_workplace.ID,
                             )
 
-                            # Allocate
                             for worker in allocating_workers:
+                                self.__fill_worker_short_free_gap_as_standby(worker)
                                 task.add_alloc_pair((worker.ID, facility.ID))
                                 worker.add_assigned_pair((task.ID, facility.ID))
                                 facility.add_assigned_pair((task.ID, worker.ID))
                                 allocating_workers.remove(worker)
-                                free_worker_list = [
-                                    w for w in free_worker_list if w.ID != worker.ID
-                                ]
+                                free_worker_list = [w for w in free_worker_list if w.ID != worker.ID]
                                 break
 
                 else:
-                    # Worker sorting
                     free_worker_list = sort_worker_list(
                         free_worker_list, task.worker_priority_rule, name=task.name
                     )
-
-                    # Extract only candidate workers
                     allocating_workers = list(
                         filter(
-                            lambda worker, task=task: worker.has_workamount_skill(
-                                task.name
-                            )
+                            lambda worker, task=task: worker.has_workamount_skill(task.name)
                             and self.__is_allocated_worker(worker, task),
                             free_worker_list,
                         )
                     )
 
-                    # Allocate free workers to tasks
                     for worker in allocating_workers:
-                        if self.can_add_resources_to_task(task, worker=worker):
+                        if (
+                            self.__can_allocate_worker_with_standby(worker)
+                            and self.can_add_resources_to_task(task, worker=worker)
+                        ):
+                            self.__fill_worker_short_free_gap_as_standby(worker)
                             task.add_alloc_pair((worker.ID, None))
                             worker.add_assigned_pair((task.ID, None))
-                            free_worker_list = [
-                                w for w in free_worker_list if w.ID != worker.ID
-                            ]
+                            free_worker_list = [w for w in free_worker_list if w.ID != worker.ID]
+
+
+        # =================================================================
+        # 4. 【リソース不足のエラーチェック】
+        # 割り当て処理が終わってもなお必須タスクに誰もアサインされていない場合
+        # =================================================================
+        unallocated_mandatory = self.__has_unallocated_mandatory(mandatory_tasks)
+        if unallocated_mandatory:
+            names = ", ".join([t.name for t in unallocated_mandatory])
+            raise RuntimeError(
+                f"Mandatory task(s) could not be allocated due to resource shortage: {names}"
+            )
 
     def check_state_workflow(self, workflow: BaseWorkflow, state: BaseTaskState):
         """

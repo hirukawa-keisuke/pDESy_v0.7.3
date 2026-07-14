@@ -151,6 +151,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         default_progress: float = None,
         due_time: float = None,
         auto_task: bool = False,
+        mandatory: bool = False,  # 追加
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # Basic variables
@@ -226,6 +227,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             default_progress=default_progress,
             due_time=due_time,
             auto_task=auto_task,
+            mandatory=mandatory,  # 追加
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
@@ -351,6 +353,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         default_progress=j["default_progress"],
                         due_time=j["due_time"],
                         auto_task=j["auto_task"],
+                        mandatory=j.get("mandatory", False),  # 追加（後方互換）
                         fixing_allocating_worker_id_set=set(
                             j["fixing_allocating_worker_id_set"]
                         ),
