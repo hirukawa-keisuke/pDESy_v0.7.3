@@ -207,13 +207,34 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
                 # SLIDING
                 if self._check_sliding_work_limit(step_time, window, limit):
                     return True
-
-        # 2. 休憩制約 (連続ブロックチェックのみ)
+                
+        # 2. 休息制約
         for constraint in self.rest_constraint_list:
+            if len(constraint) < 4:
+                raise ValueError(
+                    "rest constraint must be "
+                    "(window, min_total_rest, max_required_rest_parts, "
+                    "min_longest_rest[, type])"
+                )
+
             window = constraint[0]
-            min_continuous = constraint[1]
-            
-            if self._check_continuous_rest_limit(step_time, window, min_continuous):
+            min_total_rest = constraint[1]
+            max_required_rest_parts = constraint[2]
+            min_longest_rest = constraint[3]
+            c_type = constraint[4] if len(constraint) > 4 else "SLIDING"
+
+            if c_type.upper() != "SLIDING":
+                raise NotImplementedError(
+                    "Only SLIDING is currently supported for rest constraints"
+                )
+
+            if self._check_sliding_rest_limit(
+                step_time,
+                window,
+                min_total_rest,
+                max_required_rest_parts,
+                min_longest_rest,
+            ):
                 return True
 
         return False
@@ -240,33 +261,93 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         # 今回働くと上限を超えるか
         return (current_work + 1) > limit
 
-    # 【追加】Helper関数: 連続休憩（Continuous Rest）チェック
-    def _check_continuous_rest_limit(self, step_time: int, window: int, min_continuous: int):
+    def _build_candidate_working_window(
+        self,
+        step_time: int,
+        window: int,
+    ):
+        """step_timeで働くと仮定した直近windowステップを返す。"""
         start_step = max(0, step_time - window + 1)
-        recent_states = self.state_record_list[start_step:step_time]
-        
-        # 「今回働いた」と仮定したシーケンスを作成
-        test_sequence = recent_states + [BaseWorkerState.WORKING]
-        
-        # 過去分が足りない場合はFREEで埋める
+
+        test_sequence = list(
+            self.state_record_list[start_step:step_time]
+        )
+        test_sequence.append(BaseWorkerState.WORKING)
+
+        # シミュレーション開始前は休息済みと仮定
         missing = window - len(test_sequence)
         if missing > 0:
-            test_sequence = [BaseWorkerState.FREE] * missing + test_sequence
-            
-        # 連続休憩ブロックを探す
-        max_rest_block = 0
-        current_run = 0
-        for s in test_sequence:
-            if s != BaseWorkerState.WORKING:
-                current_run += 1
-            else:
-                max_rest_block = max(max_rest_block, current_run)
-                current_run = 0
-        # ループ後の残りチェック
-        max_rest_block = max(max_rest_block, current_run)
+            test_sequence = (
+                [BaseWorkerState.FREE] * missing
+                + test_sequence
+            )
 
-        # 指定された長さ以上の休憩ブロックが一つもなければ違反
-        return max_rest_block < min_continuous
+        return test_sequence[-window:]
+
+
+    @staticmethod
+    def _extract_rest_block_lengths(state_list):
+        """連続した休息ブロックの長さを取得する。"""
+        rest_block_lengths = []
+        current_run = 0
+
+        for state in state_list:
+            if state in (
+                BaseWorkerState.FREE,
+                BaseWorkerState.ABSENCE,
+            ):
+                current_run += 1
+            elif current_run > 0:
+                rest_block_lengths.append(current_run)
+                current_run = 0
+
+        if current_run > 0:
+            rest_block_lengths.append(current_run)
+
+        return rest_block_lengths
+
+
+    def _check_sliding_rest_limit(
+        self,
+        step_time: int,
+        window: int,
+        min_total_rest: int,
+        max_required_rest_parts: int,
+        min_longest_rest: int,
+    ):
+        """
+        step_timeで働く場合に休息制約へ違反するならTrue。
+
+        必要な10時間を、規定された分割数以内で構成できるかを判定する。
+        10時間を超える余分な休息ブロックは分割数に含めない。
+        """
+        state_window = self._build_candidate_working_window(
+            step_time,
+            window,
+        )
+        rest_blocks = self._extract_rest_block_lengths(
+            state_window
+        )
+
+        # 合計休息時間
+        if sum(rest_blocks) < min_total_rest:
+            return True
+
+        # 長い休息ブロックから最大2つを選ぶ
+        usable_blocks = sorted(
+            rest_blocks,
+            reverse=True,
+        )[:max_required_rest_parts]
+
+        # 選んだ2ブロック以内で10時間を構成できない
+        if sum(usable_blocks) < min_total_rest:
+            return True
+
+        # 長い方が6時間未満
+        if max(usable_blocks, default=0) < min_longest_rest:
+            return True
+
+        return False
     
     def check_update_state_from_absence_time_list(self, step_time: int):
         """

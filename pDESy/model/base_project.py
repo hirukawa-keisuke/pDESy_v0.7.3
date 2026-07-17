@@ -1210,7 +1210,13 @@ class BaseProject(object, metaclass=ABCMeta):
 
         worker.state_record_list = prospective_state_record_list
         try:
-            violates_constraints = constraint_checker(self.time)
+            # standbyへ書き換えた各時点と、新しい作業開始時点を確認
+            check_step_list = sorted(gap_step_list) + [self.time]
+
+            violates_constraints = any(
+                constraint_checker(check_step)
+                for check_step in check_step_list
+            )
         finally:
             worker.state_record_list = original_state_record_list
 
