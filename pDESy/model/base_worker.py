@@ -77,6 +77,13 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         # Labpr regulations
         work_constraint_list: list = None,
         rest_constraint_list: list = None,
+        # --- 追加
+        assignment_priority: int = 0,
+        regular_work_threshold_list: list = None,
+        overtime_multiplier: float = 1.25,
+        activated: bool = False,
+        first_activation_step: int = None,
+        # ---
     ):
         """init."""
         # ----
@@ -123,6 +130,35 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         self.rest_constraint_list = []
         if rest_constraint_list is not None:
             self.rest_constraint_list = rest_constraint_list
+
+        # --- 追加
+        # 小さい assignment_priority ほど先に割り当てます。
+        self.assignment_priority = int(assignment_priority)
+
+        # 通常労働の閾値です。work_constraint_list（割当禁止となる上限）
+        # とは分離し、残業判定と割当優先順位にだけ使用します。
+        self.regular_work_threshold_list = regular_work_threshold_list or []
+        self.overtime_multiplier = float(overtime_multiplier)
+
+        first_working_step = next(
+            (
+                step
+                for step, worker_state in enumerate(self.state_record_list)
+                if worker_state == BaseWorkerState.WORKING
+            ),
+            None,
+        )
+        self.activated = bool(
+            activated
+            or first_working_step is not None
+            or self.state == BaseWorkerState.WORKING
+        )
+        self.first_activation_step = (
+            first_activation_step
+            if first_activation_step is not None
+            else first_working_step
+        )
+        # ---
 
     def has_facility_skill(self, facility_name: str, error_tol: float = 1e-10):
         """
@@ -183,6 +219,87 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
             skill_sd = self.quality_skill_sd_map[task_name]
         base_quality = np.random.normal(skill_mean, skill_sd)
         return base_quality  # / float(sum_of_working_task_in_this_time)
+
+    # --- 追加
+    def activate(self, step_time: int):
+        """Record that this worker has been assigned for the first time."""
+        self.activated = True
+        if self.first_activation_step is None:
+            self.first_activation_step = step_time
+
+    def would_be_overtime(
+        self,
+        step_time: int,
+        state_record_list: list[BaseWorkerState] = None,
+    ):
+        """Return whether WORKING at ``step_time`` exceeds a regular threshold.
+
+        This method classifies overtime only. Hard allocation limits remain in
+        ``work_constraint_list`` and ``check_simulation_constraints()``.
+        """
+        if step_time < 0:
+            raise ValueError("step_time must be greater than or equal to 0")
+
+        history = (
+            self.state_record_list
+            if state_record_list is None
+            else state_record_list
+        )
+
+        for constraint in self.regular_work_threshold_list:
+            if len(constraint) < 2:
+                raise ValueError(
+                    "regular_work_threshold_list entries require window and limit"
+                )
+
+            window = int(constraint[0])
+            limit = int(constraint[1])
+            threshold_type = (
+                str(constraint[2]).upper()
+                if len(constraint) > 2
+                else "FIXED"
+            )
+
+            if window <= 0 or limit < 0:
+                raise ValueError(
+                    "regular work threshold window must be positive "
+                    "and limit must be non-negative"
+                )
+
+            if threshold_type == "FIXED":
+                start_step = (step_time // window) * window
+            elif threshold_type == "SLIDING":
+                start_step = max(0, step_time - window + 1)
+            else:
+                raise ValueError(
+                    "regular work threshold type must be FIXED or SLIDING"
+                )
+
+            working_steps = history[start_step:step_time].count(
+                BaseWorkerState.WORKING
+            )
+            if working_steps + 1 > limit:
+                return True
+
+        return False
+
+    def get_assignment_priority_key(
+        self,
+        step_time: int,
+        state_record_list: list[BaseWorkerState] = None,
+    ):
+        """Return a deterministic key for minimum-crew worker allocation."""
+        return (
+            not self.activated,
+            self.would_be_overtime(
+                step_time,
+                state_record_list=state_record_list,
+            ),
+            self.assignment_priority,
+            self.name,
+            self.ID,
+        )
+    # ---
 
     # 【追加】制約チェックのメイン関数
     def check_simulation_constraints(self, step_time: int):
@@ -395,6 +512,10 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
         if state_info:
             self.state = BaseWorkerState.FREE
             self.assigned_task_facility_id_tuple_set = frozenset()
+            # --- 追加
+            self.activated = False
+            self.first_activation_step = None
+            # ---
 
         if log_info:
             self.state_record_list = []
@@ -656,6 +777,13 @@ class BaseWorker(object, metaclass=abc.ABCMeta):
             assigned_task_facility_id_tuple_set_record_list=assigned_history,
             work_constraint_list=self.work_constraint_list,
             rest_constraint_list=self.rest_constraint_list,
+            # --- 追加
+            assignment_priority=self.assignment_priority,
+            regular_work_threshold_list=self.regular_work_threshold_list,
+            overtime_multiplier=self.overtime_multiplier,
+            activated=self.activated,
+            first_activation_step=self.first_activation_step,
+            # ---
         )
         return dict_json_data
 

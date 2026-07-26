@@ -25,6 +25,9 @@ import plotly.graph_objects as go
 from .base_component import BaseComponent, BaseComponentState
 from .base_facility import BaseFacility, BaseFacilityState
 from .base_priority_rule import (
+    # --- 追加
+    ResourcePriorityRuleMode,
+    # ---
     TaskPriorityRuleMode,
     sort_worker_list,
     sort_facility_list,
@@ -1204,9 +1207,11 @@ class BaseProject(object, metaclass=ABCMeta):
             return True
 
         original_state_record_list = worker.state_record_list
-        prospective_state_record_list = original_state_record_list.copy()
-        for standby_step in gap_step_list:
-            prospective_state_record_list[standby_step] = BaseWorkerState.WORKING
+        # --- 追加
+        prospective_state_record_list = (
+            self.__create_worker_prospective_state_record_list(worker)
+        )
+        # ---
 
         worker.state_record_list = prospective_state_record_list
         try:
@@ -1221,6 +1226,33 @@ class BaseProject(object, metaclass=ABCMeta):
             worker.state_record_list = original_state_record_list
 
         return not violates_constraints
+
+    # --- 追加
+    def __create_worker_prospective_state_record_list(
+        self,
+        worker: BaseWorker,
+    ):
+        """Return history after prospectively converting a short gap to standby."""
+        prospective_state_record_list = worker.state_record_list.copy()
+        for standby_step in self.__get_worker_short_free_gap_step_list(worker):
+            prospective_state_record_list[standby_step] = BaseWorkerState.WORKING
+        return prospective_state_record_list
+
+    def __create_worker_assignment_priority_key_map(
+        self,
+        worker_list: list[BaseWorker],
+    ):
+        """Build CREW priority keys with prospective standby included."""
+        return {
+            worker: worker.get_assignment_priority_key(
+                self.time,
+                state_record_list=(
+                    self.__create_worker_prospective_state_record_list(worker)
+                ),
+            )
+            for worker in worker_list
+        }
+    # ---
 
     def __fill_worker_short_free_gap_as_standby(self, worker: BaseWorker):
         """Reclassify a validated short trailing FREE gap as WORKING standby.
@@ -1550,15 +1582,29 @@ class BaseProject(object, metaclass=ABCMeta):
                                     free_worker_list,
                                 )
                             )
+                            # --- 追加
                             allocating_workers = sort_worker_list(
                                 allocating_workers,
                                 task.worker_priority_rule,
                                 name=task.name,
                                 workplace_id=placed_workplace.ID,
+                                step_time=self.time,
+                                priority_key_map=(
+                                    self.__create_worker_assignment_priority_key_map(
+                                        allocating_workers
+                                    )
+                                    if task.worker_priority_rule
+                                    == ResourcePriorityRuleMode.CREW
+                                    else None
+                                ),
                             )
+                            # ---
 
                             for worker in allocating_workers:
                                 self.__fill_worker_short_free_gap_as_standby(worker)
+                                # --- 追加
+                                worker.activate(self.time)
+                                # ---
                                 task.add_alloc_pair((worker.ID, facility.ID))
                                 worker.add_assigned_pair((task.ID, facility.ID))
                                 facility.add_assigned_pair((task.ID, worker.ID))
@@ -1567,9 +1613,22 @@ class BaseProject(object, metaclass=ABCMeta):
                                 break
 
                 else:
+                    # --- 追加
                     free_worker_list = sort_worker_list(
-                        free_worker_list, task.worker_priority_rule, name=task.name
+                        free_worker_list,
+                        task.worker_priority_rule,
+                        name=task.name,
+                        step_time=self.time,
+                        priority_key_map=(
+                            self.__create_worker_assignment_priority_key_map(
+                                free_worker_list
+                            )
+                            if task.worker_priority_rule
+                            == ResourcePriorityRuleMode.CREW
+                            else None
+                        ),
                     )
+                    # ---
                     allocating_workers = list(
                         filter(
                             lambda worker, task=task: worker.has_workamount_skill(task.name)
@@ -1584,6 +1643,9 @@ class BaseProject(object, metaclass=ABCMeta):
                             and self.can_add_resources_to_task(task, worker=worker)
                         ):
                             self.__fill_worker_short_free_gap_as_standby(worker)
+                            # --- 追加
+                            worker.activate(self.time)
+                            # ---
                             task.add_alloc_pair((worker.ID, None))
                             worker.add_assigned_pair((task.ID, None))
                             free_worker_list = [w for w in free_worker_list if w.ID != worker.ID]

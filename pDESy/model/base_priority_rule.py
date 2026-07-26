@@ -35,6 +35,10 @@ class ResourcePriorityRuleMode(IntEnum):
     SSP = 0  # a worker which amount of skill point is lower has high priority
     VC = 1  # a worker which cost is lower has high priority
     HSV = 2  # a worker which target skill point is higher has high priority
+    # --- 追加
+    ORDER = 3  # explicit assignment_priority order
+    CREW = 4  # activated -> non-overtime -> assignment_priority
+    # ---
 
 
 class TaskPriorityRuleMode(IntEnum):
@@ -173,6 +177,38 @@ def sort_worker_list(
                 worker.main_workplace_id is not None,
             ),
         )
+    # --- 追加
+    # ORDER: dc1, dc2, ... のような明示順だけで割り当てます。
+    elif priority_rule_mode == ResourcePriorityRuleMode.ORDER:
+        worker_list = sorted(
+            worker_list,
+            key=lambda worker: (
+                worker.assignment_priority,
+                worker.name,
+                worker.ID,
+            ),
+        )
+    # CREW: 稼働済み人員を優先して必要人数を抑え、その中では
+    # 通常労働内、assignment_priority の順に割り当てます。
+    elif priority_rule_mode == ResourcePriorityRuleMode.CREW:
+        priority_key_map = kwargs.get("priority_key_map")
+        step_time = kwargs.get("step_time")
+        if priority_key_map is None and step_time is None:
+            raise ValueError(
+                "step_time or priority_key_map must be provided for CREW mode."
+            )
+
+        if priority_key_map is None:
+            priority_key_map = {
+                worker: worker.get_assignment_priority_key(step_time)
+                for worker in worker_list
+            }
+
+        worker_list = sorted(
+            worker_list,
+            key=lambda worker: priority_key_map[worker],
+        )
+    # ---
 
     return worker_list
 

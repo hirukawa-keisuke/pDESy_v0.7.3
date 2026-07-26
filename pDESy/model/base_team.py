@@ -180,6 +180,13 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
         quality_skill_sd_map: dict[str, float] = None,
         work_constraint_list: list = None,
         rest_constraint_list: list = None,
+        # --- 追加
+        assignment_priority: int = 0,
+        regular_work_threshold_list: list = None,
+        overtime_multiplier: float = 1.25,
+        activated: bool = False,
+        first_activation_step: int = None,
+        # ---
     ):
         """
         Create a BaseWorker instance and add it to this team.
@@ -229,6 +236,13 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
             quality_skill_sd_map=quality_skill_sd_map,
             work_constraint_list=work_constraint_list,
             rest_constraint_list=rest_constraint_list,
+            # --- 追加
+            assignment_priority=assignment_priority,
+            regular_work_threshold_list=regular_work_threshold_list,
+            overtime_multiplier=overtime_multiplier,
+            activated=activated,
+            first_activation_step=first_activation_step,
+            # ---
         )
         self.add_worker(worker)
         return worker
@@ -365,6 +379,17 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
                 assigned_task_facility_id_tuple_set_record_list=w[
                     "assigned_task_facility_id_tuple_set_record_list"
                 ],
+                # --- 追加
+                work_constraint_list=w.get("work_constraint_list"),
+                rest_constraint_list=w.get("rest_constraint_list"),
+                assignment_priority=w.get("assignment_priority", 0),
+                regular_work_threshold_list=w.get(
+                    "regular_work_threshold_list"
+                ),
+                overtime_multiplier=w.get("overtime_multiplier", 1.25),
+                activated=w.get("activated", False),
+                first_activation_step=w.get("first_activation_step"),
+                # ---
             )
             self.worker_set.add(worker)
         self.targeted_task_id_set = set(json_data["targeted_task_id_set"])
