@@ -706,6 +706,24 @@ class BaseProject(object, metaclass=ABCMeta):
 
         self.initialize(state_info=initialize_state_info, log_info=initialize_log_info)
 
+        # Parallel-group synchronization is required only for the first start.
+        # Reconstruct the set when continuing an existing simulation state.
+        self._started_parallel_group_key_set = set()
+        for key, tasks in self.__create_parallel_group_map().items():
+            if any(
+                task.state
+                in (
+                    BaseTaskState.WORKING,
+                    BaseTaskState.WORKING_ADDITIONALLY,
+                    BaseTaskState.FINISHED,
+                )
+                or BaseTaskState.WORKING in task.state_record_list
+                or BaseTaskState.WORKING_ADDITIONALLY in task.state_record_list
+                or BaseTaskState.FINISHED in task.state_record_list
+                for task in tasks
+            ):
+                self._started_parallel_group_key_set.add(key)
+
         self.simulation_mode = SimulationMode.FORWARD
 
         self.absence_time_list = absence_time_list
@@ -1371,6 +1389,288 @@ class BaseProject(object, metaclass=ABCMeta):
                 break
             cur = self.workplace_dict.get(cur.parent_workplace_id, None)
 
+    @staticmethod
+    def __parallel_group_key(task: BaseTask):
+        """Return the workflow-scoped parallel group key for a task."""
+        if task.parallel_group_id is None:
+            return None
+        return (task.parent_workflow_id, task.parallel_group_id)
+
+    def __create_parallel_group_map(self):
+        """Collect parallel-group members across the project."""
+        group_map = {}
+        for task in self.task_set:
+            key = self.__parallel_group_key(task)
+            if key is not None:
+                group_map.setdefault(key, []).append(task)
+        for tasks in group_map.values():
+            tasks.sort(key=lambda task: (task.name, task.ID))
+        return group_map
+
+    def __place_task_component_for_allocation(
+        self,
+        task: BaseTask,
+        target_workplace_id_set: set[str],
+    ):
+        """Apply the existing component-placement policy before allocation."""
+        if task.target_component_id is None:
+            return
+
+        component = self.component_dict.get(task.target_component_id, None)
+        if component is None or not self.is_ready_component(component):
+            return
+
+        candidate_workplace_set = [
+            workplace
+            for workplace in self.workplace_set
+            if workplace.ID in task.allocated_workplace_id_set
+        ]
+        candidate_workplace_set = sort_workplace_list(
+            candidate_workplace_set,
+            task.workplace_priority_rule,
+            name=task.name,
+        )
+        for workplace in candidate_workplace_set:
+            if workplace.ID not in target_workplace_id_set:
+                continue
+
+            conveyor_condition = True
+            if workplace.input_workplace_id_set:
+                if component.placed_workplace_id is not None and (
+                    component.placed_workplace_id
+                    not in workplace.input_workplace_id_set
+                ):
+                    conveyor_condition = False
+
+            skill_flag = workplace.get_total_workamount_skill(task.name) > 1e-10
+            if task.auto_task:
+                skill_flag = True
+
+            if not (
+                conveyor_condition
+                and self.can_put_component_to_workplace(workplace, component)
+                and skill_flag
+            ):
+                continue
+
+            pre_workplace = self.workplace_dict.get(
+                component.placed_workplace_id, None
+            )
+            if pre_workplace is None:
+                for child_c_id in component.child_component_id_set:
+                    child_c = self.component_dict.get(child_c_id, None)
+                    child_workplace = self.workplace_dict.get(
+                        child_c.placed_workplace_id, None
+                    )
+                    if child_workplace is None:
+                        continue
+                    for placed_component_id in child_workplace.placed_component_id_set:
+                        placed_component = self.component_dict.get(
+                            placed_component_id, None
+                        )
+                        if any(
+                            child_id == task.target_component_id
+                            for child_id in placed_component.child_component_id_set
+                        ):
+                            self.remove_component_on_workplace(
+                                placed_component, child_workplace
+                            )
+            else:
+                self.remove_component_on_workplace(component, pre_workplace)
+
+            self.set_component_on_workplace(component, None)
+            self.set_component_on_workplace(component, workplace)
+            return
+
+    def __get_parallel_allocation_candidates(
+        self,
+        task: BaseTask,
+        free_worker_list: list[BaseWorker],
+    ):
+        """Return ordered worker/facility candidates without changing state."""
+        if task.need_facility:
+            target_component = self.component_dict.get(
+                task.target_component_id, None
+            )
+            if target_component is None:
+                return []
+            placed_workplace = self.workplace_dict.get(
+                target_component.placed_workplace_id, None
+            )
+            if placed_workplace is None:
+                return []
+
+            candidate_facility_set = set()
+            for workplace in self.__iter_workplace_and_ancestors(placed_workplace):
+                candidate_facility_set.update(workplace.facility_set)
+            free_facility_list = [
+                facility
+                for facility in candidate_facility_set
+                if facility.state == BaseFacilityState.FREE
+            ]
+            free_facility_list = sort_facility_list(
+                free_facility_list,
+                task.facility_priority_rule,
+                name=task.name,
+            )
+
+            candidates = []
+            for facility in free_facility_list:
+                if not facility.has_workamount_skill(task.name):
+                    continue
+                allocating_workers = [
+                    worker
+                    for worker in free_worker_list
+                    if (
+                        worker.has_workamount_skill(task.name)
+                        and self.__is_allocated_worker(worker, task)
+                        and self.__can_allocate_worker_with_standby(worker)
+                        and self.can_add_resources_to_task(
+                            task, worker=worker, facility=facility
+                        )
+                    )
+                ]
+                allocating_workers = sort_worker_list(
+                    allocating_workers,
+                    task.worker_priority_rule,
+                    name=task.name,
+                    workplace_id=placed_workplace.ID,
+                    step_time=self.time,
+                    priority_key_map=(
+                        self.__create_worker_assignment_priority_key_map(
+                            allocating_workers
+                        )
+                        if task.worker_priority_rule
+                        == ResourcePriorityRuleMode.CREW
+                        else None
+                    ),
+                )
+                candidates.extend(
+                    (worker, facility) for worker in allocating_workers
+                )
+            return candidates
+
+        allocating_workers = [
+            worker
+            for worker in free_worker_list
+            if (
+                worker.has_workamount_skill(task.name)
+                and self.__is_allocated_worker(worker, task)
+                and self.__can_allocate_worker_with_standby(worker)
+                and self.can_add_resources_to_task(task, worker=worker)
+            )
+        ]
+        allocating_workers = sort_worker_list(
+            allocating_workers,
+            task.worker_priority_rule,
+            name=task.name,
+            step_time=self.time,
+            priority_key_map=(
+                self.__create_worker_assignment_priority_key_map(
+                    allocating_workers
+                )
+                if task.worker_priority_rule == ResourcePriorityRuleMode.CREW
+                else None
+            ),
+        )
+        return [(worker, None) for worker in allocating_workers]
+
+    def __plan_parallel_group_allocation(
+        self,
+        group_tasks: list[BaseTask],
+        free_worker_list: list[BaseWorker],
+    ):
+        """Find one distinct resource pair per manual task in a group."""
+        requirements = []
+        for task in group_tasks:
+            if task.auto_task or task.allocated_worker_facility_id_tuple_set:
+                continue
+            candidates = self.__get_parallel_allocation_candidates(
+                task, free_worker_list
+            )
+            if not candidates:
+                return None
+            requirements.append((task, candidates))
+
+        if len(requirements) > len(free_worker_list):
+            return None
+        candidate_worker_ids = {
+            worker.ID
+            for _, candidates in requirements
+            for worker, _ in candidates
+        }
+        if len(candidate_worker_ids) < len(requirements):
+            return None
+        facility_requirements = [
+            (task, candidates)
+            for task, candidates in requirements
+            if task.need_facility
+        ]
+        candidate_facility_ids = {
+            facility.ID
+            for _, candidates in facility_requirements
+            for _, facility in candidates
+            if facility is not None
+        }
+        if len(candidate_facility_ids) < len(facility_requirements):
+            return None
+
+        requirements.sort(
+            key=lambda item: (len(item[1]), item[0].name, item[0].ID)
+        )
+        plan = []
+        used_worker_ids = set()
+        used_facility_ids = set()
+        failed_states = set()
+
+        def search(index: int):
+            if index >= len(requirements):
+                return True
+
+            state = (
+                index,
+                frozenset(used_worker_ids),
+                frozenset(used_facility_ids),
+            )
+            if state in failed_states:
+                return False
+
+            task, candidates = requirements[index]
+            for worker, facility in candidates:
+                if worker.ID in used_worker_ids:
+                    continue
+                if facility is not None and facility.ID in used_facility_ids:
+                    continue
+
+                used_worker_ids.add(worker.ID)
+                if facility is not None:
+                    used_facility_ids.add(facility.ID)
+                plan.append((task, worker, facility))
+
+                if search(index + 1):
+                    return True
+
+                plan.pop()
+                used_worker_ids.remove(worker.ID)
+                if facility is not None:
+                    used_facility_ids.remove(facility.ID)
+
+            failed_states.add(state)
+            return False
+
+        return plan if search(0) else None
+
+    def __commit_parallel_group_allocation(self, plan):
+        """Commit a previously validated parallel-group allocation plan."""
+        for task, worker, facility in plan:
+            facility_id = facility.ID if facility is not None else None
+            self.__fill_worker_short_free_gap_as_standby(worker)
+            worker.activate(self.time)
+            task.add_alloc_pair((worker.ID, facility_id))
+            worker.add_assigned_pair((task.ID, facility_id))
+            if facility is not None:
+                facility.add_assigned_pair((task.ID, worker.ID))
+
     def __find_unallocated_immediate_tasks(
         self, immediate_tasks: list[BaseTask]
     ) -> list[BaseTask]:
@@ -1419,11 +1719,38 @@ class BaseProject(object, metaclass=ABCMeta):
         self,
         task_priority_rule: TaskPriorityRuleMode = TaskPriorityRuleMode.TSLACK,
     ):
-        immediate_ready_tasks = [
-            task
-            for task in self.task_set
-            if task.must_start_immediately and task.state == BaseTaskState.READY
-        ]
+        parallel_group_map = self.__create_parallel_group_map()
+        pending_parallel_group_keys = {
+            key
+            for key in parallel_group_map
+            if key
+            not in getattr(self, "_started_parallel_group_key_set", set())
+        }
+        ready_parallel_group_keys = {
+            key
+            for key, tasks in parallel_group_map.items()
+            if key in pending_parallel_group_keys
+            and all(task.state == BaseTaskState.READY for task in tasks)
+        }
+
+        # A mixed group is immediate when any member is immediate. The deadline
+        # is the step in which the final member becomes READY.
+        immediate_ready_tasks = []
+        for task in self.task_set:
+            if task.state != BaseTaskState.READY:
+                continue
+            group_key = self.__parallel_group_key(task)
+            if group_key is None or group_key not in pending_parallel_group_keys:
+                if task.must_start_immediately:
+                    immediate_ready_tasks.append(task)
+                continue
+            if group_key not in ready_parallel_group_keys:
+                continue
+            group_tasks = parallel_group_map[group_key]
+            if any(member.must_start_immediately for member in group_tasks):
+                immediate_ready_tasks.extend(group_tasks)
+
+        immediate_ready_tasks = list(set(immediate_ready_tasks))
         if immediate_ready_tasks:
             self.__preempt_non_immediate_allocations()
 
@@ -1469,8 +1796,44 @@ class BaseProject(object, metaclass=ABCMeta):
         # 3. 実際の割り当て処理（ループは1回のみ！）
         # =================================================================
         target_workplace_id_set = {wp.ID for wp in self.workplace_set}
+        processed_parallel_group_keys = set()
 
         for task in ready_and_working_task_list:
+            parallel_group_key = self.__parallel_group_key(task)
+            if (
+                parallel_group_key is not None
+                and parallel_group_key in pending_parallel_group_keys
+            ):
+                if parallel_group_key in processed_parallel_group_keys:
+                    continue
+                processed_parallel_group_keys.add(parallel_group_key)
+
+                if parallel_group_key not in ready_parallel_group_keys:
+                    continue
+
+                parallel_group_tasks = parallel_group_map[parallel_group_key]
+                for group_task in parallel_group_tasks:
+                    self.__place_task_component_for_allocation(
+                        group_task, target_workplace_id_set
+                    )
+
+                allocation_plan = self.__plan_parallel_group_allocation(
+                    parallel_group_tasks, free_worker_list
+                )
+                if allocation_plan is None:
+                    continue
+
+                self.__commit_parallel_group_allocation(allocation_plan)
+                self._started_parallel_group_key_set.add(parallel_group_key)
+                allocated_worker_ids = {
+                    worker.ID for _, worker, _ in allocation_plan
+                }
+                free_worker_list = [
+                    worker
+                    for worker in free_worker_list
+                    if worker.ID not in allocated_worker_ids
+                ]
+                continue
             
             # --- 設備・コンポーネント関連の配置ロジック ---
             if task.target_component_id is not None:

@@ -152,6 +152,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         due_time: float = None,
         auto_task: bool = False,
         must_start_immediately: bool = False,
+        parallel_group_id: str = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # Basic variables
@@ -195,6 +196,9 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             must_start_immediately (bool, optional): If True, allocation must
                 succeed in the task's first eligible simulation step. Defaults
                 to False.
+            parallel_group_id (str, optional): Workflow-scoped identifier for
+                tasks that must start in the same simulation step. Defaults to
+                None.
             fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
             est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -231,6 +235,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             due_time=due_time,
             auto_task=auto_task,
             must_start_immediately=must_start_immediately,
+            parallel_group_id=parallel_group_id,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
@@ -305,6 +310,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         must_start_immediately=j.get(
                             "must_start_immediately", j.get("mandatory", False)
                         ),
+                        parallel_group_id=j.get("parallel_group_id"),
                         fixing_allocating_worker_id_set=(
                             set(j["fixing_allocating_worker_id_set"])
                             if j["fixing_allocating_worker_id_set"] is not None
@@ -362,6 +368,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         must_start_immediately=j.get(
                             "must_start_immediately", j.get("mandatory", False)
                         ),
+                        parallel_group_id=j.get("parallel_group_id"),
                         fixing_allocating_worker_id_set=set(
                             j["fixing_allocating_worker_id_set"]
                         ),
@@ -478,6 +485,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         due_time: int = None,
         auto_task: bool = None,
         must_start_immediately: bool = None,
+        parallel_group_id: str = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # search param
@@ -511,6 +519,8 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             auto_task (bool, optional): Target task auto_task. Defaults to None.
             must_start_immediately (bool, optional): Target task
                 must_start_immediately. Defaults to None.
+            parallel_group_id (str, optional): Target task parallel_group_id.
+                Defaults to None.
             fixing_allocating_worker_id_set (set[str], optional): Target task fixing_allocating_worker_id_set. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Target task fixing_allocating_facility_id_set. Defaults to None.
             est (float, optional): Target task est. Defaults to None.
@@ -584,6 +594,13 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                 filter(
                     lambda task: task.must_start_immediately
                     == must_start_immediately,
+                    task_set,
+                )
+            )
+        if parallel_group_id is not None:
+            task_set = set(
+                filter(
+                    lambda task: task.parallel_group_id == parallel_group_id,
                     task_set,
                 )
             )

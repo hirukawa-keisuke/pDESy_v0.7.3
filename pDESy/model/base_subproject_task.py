@@ -50,6 +50,7 @@ class BaseSubProjectTask(BaseTask):
         due_time: float = None,
         auto_task: bool = True,
         must_start_immediately: bool = False,
+        parallel_group_id: str = None,
         fixing_allocating_worker_id_set: set = None,
         fixing_allocating_facility_id_set: set = None,
         # Basic variables
@@ -94,6 +95,8 @@ class BaseSubProjectTask(BaseTask):
             auto_task (bool, optional): Whether the task is automatic.
             must_start_immediately (bool, optional): Whether allocation must
                 succeed in the first eligible simulation step.
+            parallel_group_id (str, optional): Workflow-scoped identifier for
+                tasks that must start in the same simulation step.
             fixing_allocating_worker_id_set (set, optional): Set of fixed allocating worker IDs.
             fixing_allocating_facility_id_set (set, optional): Set of fixed allocating facility IDs.
             est (float, optional): Earliest start time.
@@ -136,6 +139,7 @@ class BaseSubProjectTask(BaseTask):
             due_time=due_time,
             auto_task=auto_task,
             must_start_immediately=must_start_immediately,
+            parallel_group_id=parallel_group_id,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables

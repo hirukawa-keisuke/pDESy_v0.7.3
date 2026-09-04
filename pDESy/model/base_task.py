@@ -80,6 +80,9 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         must_start_immediately (bool, optional): If True, the task must acquire
             resources in the same simulation step in which it becomes ready.
             Defaults to False.
+        parallel_group_id (str, optional): Tasks with the same non-None value in
+            the same workflow are allocated atomically and start in the same
+            simulation step. Defaults to None.
         fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
         fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
         est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -117,6 +120,7 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         due_time: int = int(-1),
         auto_task: bool = False,
         must_start_immediately: bool = False,
+        parallel_group_id: str = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # Basic variables
@@ -194,6 +198,9 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         self.due_time = due_time or int(-1)
         self.auto_task = auto_task if auto_task is not False else False
         self.must_start_immediately = bool(must_start_immediately)
+        self.parallel_group_id = (
+            str(parallel_group_id) if parallel_group_id is not None else None
+        )
         self.fixing_allocating_worker_id_set = fixing_allocating_worker_id_set or None
         self.fixing_allocating_facility_id_set = (
             fixing_allocating_facility_id_set or None
@@ -272,6 +279,7 @@ class BaseTask(object, metaclass=abc.ABCMeta):
             due_time=self.due_time,
             auto_task=self.auto_task,
             must_start_immediately=self.must_start_immediately,
+            parallel_group_id=self.parallel_group_id,
             fixing_allocating_worker_id_set=(
                 list(self.fixing_allocating_worker_id_set)
                 if self.fixing_allocating_worker_id_set is not None

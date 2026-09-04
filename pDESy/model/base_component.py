@@ -252,6 +252,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
         due_time=None,
         auto_task=False,
         must_start_immediately=False,
+        parallel_group_id=None,
         fixing_allocating_worker_id_set=None,
         fixing_allocating_facility_id_set=None,
         # Basic variables
@@ -292,6 +293,9 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             must_start_immediately (bool, optional): If True, allocation must
                 succeed in the task's first eligible simulation step. Defaults
                 to False.
+            parallel_group_id (str, optional): Workflow-scoped identifier for
+                tasks that must start in the same simulation step. Defaults to
+                None.
             fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
             est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -328,6 +332,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             due_time=due_time,
             auto_task=auto_task,
             must_start_immediately=must_start_immediately,
+            parallel_group_id=parallel_group_id,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
