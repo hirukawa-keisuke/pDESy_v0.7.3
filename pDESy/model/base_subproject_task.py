@@ -49,7 +49,7 @@ class BaseSubProjectTask(BaseTask):
         default_progress: float = None,
         due_time: float = None,
         auto_task: bool = True,
-        mandatory: bool = False,  # 追加
+        must_start_immediately: bool = False,
         fixing_allocating_worker_id_set: set = None,
         fixing_allocating_facility_id_set: set = None,
         # Basic variables
@@ -92,6 +92,8 @@ class BaseSubProjectTask(BaseTask):
             default_progress (float, optional): Default progress.
             due_time (float, optional): Due time.
             auto_task (bool, optional): Whether the task is automatic.
+            must_start_immediately (bool, optional): Whether allocation must
+                succeed in the first eligible simulation step.
             fixing_allocating_worker_id_set (set, optional): Set of fixed allocating worker IDs.
             fixing_allocating_facility_id_set (set, optional): Set of fixed allocating facility IDs.
             est (float, optional): Earliest start time.
@@ -133,7 +135,7 @@ class BaseSubProjectTask(BaseTask):
             default_progress=default_progress,
             due_time=due_time,
             auto_task=auto_task,
-            mandatory=mandatory,  # 追加
+            must_start_immediately=must_start_immediately,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables

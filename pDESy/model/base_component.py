@@ -251,6 +251,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
         default_progress=None,
         due_time=None,
         auto_task=False,
+        must_start_immediately=False,
         fixing_allocating_worker_id_set=None,
         fixing_allocating_facility_id_set=None,
         # Basic variables
@@ -288,6 +289,9 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             default_progress (float, optional): Progress before starting simulation (0.0 ~ 1.0). Defaults to None -> 0.0.
             due_time (int, optional): Defaults to None -> int(-1).
             auto_task (bool, optional): If True, this task is performed automatically even if there are no allocated workers. Defaults to False.
+            must_start_immediately (bool, optional): If True, allocation must
+                succeed in the task's first eligible simulation step. Defaults
+                to False.
             fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
             est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -323,6 +327,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             default_progress=default_progress,
             due_time=due_time,
             auto_task=auto_task,
+            must_start_immediately=must_start_immediately,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables

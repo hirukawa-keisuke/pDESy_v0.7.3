@@ -800,9 +800,21 @@ class BaseProject(object, metaclass=ABCMeta):
 
                 # 2. Allocate free workers to READY tasks
                 if working:
-                    self.__allocate(
+                    failed_immediate_tasks = self.__allocate(
                         task_priority_rule=task_priority_rule,
                     )
+                    if failed_immediate_tasks:
+                        self.status = BaseProjectStatus.FINISHED_FAILURE
+                        names = ", ".join(task.name for task in failed_immediate_tasks)
+                        warnings.warn(
+                            "Task(s) required to start immediately could not be "
+                            f"allocated at step {self.time}: {names}"
+                        )
+                        if pbar is not None:
+                            pbar.n = self.time
+                            pbar.refresh()
+                            pbar.set_description("Immediate start failed")
+                        return
 
                 # Update state of task newly allocated workers and facilities (READY -> WORKING)
                 for workflow in self.workflow_set:
@@ -1359,48 +1371,22 @@ class BaseProject(object, metaclass=ABCMeta):
                 break
             cur = self.workplace_dict.get(cur.parent_workplace_id, None)
 
-    # =================================================================
-    # 【追加実装】
-    # =================================================================
-    # def __preempt_non_mandatory_allocations(self):
-    #     """非必須タスクの割当を強制解除（プリエンプション）"""
-    #     for task in self.task_set:
-    #         if getattr(task, "mandatory", False):
-    #             continue
-    #         if not task.allocated_worker_facility_id_tuple_set:
-    #             continue
-
-    #         # 割当解除
-    #         for worker_id, facility_id in task.allocated_worker_facility_id_tuple_set:
-    #             worker = self.worker_dict.get(worker_id, None)
-    #             facility = self.facility_dict.get(facility_id, None)
-
-    #             if worker is not None:
-    #                 worker.remove_assigned_pair((task.ID, facility_id))
-    #                 worker.state = BaseWorkerState.FREE
-
-    #             if facility is not None:
-    #                 facility.remove_assigned_pair((task.ID, worker_id))
-    #                 facility.state = BaseFacilityState.FREE
-
-    #         task.allocated_worker_facility_id_tuple_set = frozenset()
-    #         if task.state == BaseTaskState.WORKING:
-    #             task.state = BaseTaskState.READY
-
-    def __has_unallocated_mandatory(self, mandatory_tasks: list[BaseTask]) -> list[BaseTask]:
-        """必須タスクのうち、割当が足りないものを返す"""
+    def __find_unallocated_immediate_tasks(
+        self, immediate_tasks: list[BaseTask]
+    ) -> list[BaseTask]:
+        """Return immediate-start tasks that have no resource allocation."""
         unallocated = []
-        for t in mandatory_tasks:
-            if t.auto_task:
+        for task in immediate_tasks:
+            if task.auto_task:
                 continue
-            if len(t.allocated_worker_facility_id_tuple_set) == 0:
-                unallocated.append(t)
+            if not task.allocated_worker_facility_id_tuple_set:
+                unallocated.append(task)
         return unallocated
 
-    def __preempt_non_mandatory_allocations(self):
-        """非必須タスクを中断してリソースを解放し、READY状態に戻す"""
+    def __preempt_non_immediate_allocations(self):
+        """Release resources from interruptible tasks and return them to READY."""
         for task in self.task_set:
-            if not getattr(task, "mandatory", False):
+            if not task.must_start_immediately:
                 # すでに割り当てがある場合（WORKING、あるいはREADYで割り当て済み）
                 if len(task.allocated_worker_facility_id_tuple_set) > 0:
                     
@@ -1433,17 +1419,13 @@ class BaseProject(object, metaclass=ABCMeta):
         self,
         task_priority_rule: TaskPriorityRuleMode = TaskPriorityRuleMode.TSLACK,
     ):
-        # =================================================================
-        # 0. 【プリエンプション・フェーズ】
-        # 必須タスクがREADYで待機しているかチェックし、待機しているなら
-        # 優先度の低い非必須タスクから一旦リソースを剥がしてFREEにする
-        # =================================================================
-        mandatory_ready_tasks = [
-            t for t in self.task_set 
-            if getattr(t, "mandatory", False) and t.state == BaseTaskState.READY
+        immediate_ready_tasks = [
+            task
+            for task in self.task_set
+            if task.must_start_immediately and task.state == BaseTaskState.READY
         ]
-        if len(mandatory_ready_tasks) > 0:
-            self.__preempt_non_mandatory_allocations()
+        if immediate_ready_tasks:
+            self.__preempt_non_immediate_allocations()
 
 
         # =================================================================
@@ -1476,11 +1458,11 @@ class BaseProject(object, metaclass=ABCMeta):
             ready_and_working_task_list, task_priority_rule
         )
         
-        mandatory_tasks = [t for t in ready_and_working_task_list if getattr(t, "mandatory", False)]
-        non_mandatory_tasks = [t for t in ready_and_working_task_list if not getattr(t, "mandatory", False)]
+        immediate_tasks = [t for t in ready_and_working_task_list if t.must_start_immediately]
+        interruptible_tasks = [t for t in ready_and_working_task_list if not t.must_start_immediately]
         
-        # 必須タスク -> 非必須タスク の順に並べる
-        ready_and_working_task_list = mandatory_tasks + non_mandatory_tasks
+        # Preserve the selected priority order within each group.
+        ready_and_working_task_list = immediate_tasks + interruptible_tasks
 
 
         # =================================================================
@@ -1655,12 +1637,10 @@ class BaseProject(object, metaclass=ABCMeta):
         # 4. 【リソース不足のエラーチェック】
         # 割り当て処理が終わってもなお必須タスクに誰もアサインされていない場合
         # =================================================================
-        unallocated_mandatory = self.__has_unallocated_mandatory(mandatory_tasks)
-        if unallocated_mandatory:
-            names = ", ".join([t.name for t in unallocated_mandatory])
-            raise RuntimeError(
-                f"Mandatory task(s) could not be allocated due to resource shortage: {names}"
-            )
+        # The result is checked before this simulation step performs or records
+        # any work, so an immediate-start requirement is decided in the same step
+        # in which the task becomes READY.
+        return self.__find_unallocated_immediate_tasks(immediate_ready_tasks)
 
     def check_state_workflow(self, workflow: BaseWorkflow, state: BaseTaskState):
         """

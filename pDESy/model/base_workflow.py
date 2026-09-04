@@ -151,7 +151,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         default_progress: float = None,
         due_time: float = None,
         auto_task: bool = False,
-        mandatory: bool = False,  # 追加
+        must_start_immediately: bool = False,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # Basic variables
@@ -192,6 +192,9 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             default_progress (float, optional): Progress before starting simulation (0.0 ~ 1.0). Defaults to None -> 0.0.
             due_time (int, optional): Due time. Defaults to None -> int(-1).
             auto_task (bool, optional): If True, this task is performed automatically even if there are no allocated workers. Defaults to False.
+            must_start_immediately (bool, optional): If True, allocation must
+                succeed in the task's first eligible simulation step. Defaults
+                to False.
             fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
             est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -227,7 +230,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             default_progress=default_progress,
             due_time=due_time,
             auto_task=auto_task,
-            mandatory=mandatory,  # 追加
+            must_start_immediately=must_start_immediately,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
@@ -299,6 +302,9 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         default_progress=j["default_progress"],
                         due_time=j["due_time"],
                         auto_task=j["auto_task"],
+                        must_start_immediately=j.get(
+                            "must_start_immediately", j.get("mandatory", False)
+                        ),
                         fixing_allocating_worker_id_set=(
                             set(j["fixing_allocating_worker_id_set"])
                             if j["fixing_allocating_worker_id_set"] is not None
@@ -353,7 +359,9 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         default_progress=j["default_progress"],
                         due_time=j["due_time"],
                         auto_task=j["auto_task"],
-                        mandatory=j.get("mandatory", False),  # 追加（後方互換）
+                        must_start_immediately=j.get(
+                            "must_start_immediately", j.get("mandatory", False)
+                        ),
                         fixing_allocating_worker_id_set=set(
                             j["fixing_allocating_worker_id_set"]
                         ),
@@ -469,6 +477,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         default_progress: float = None,
         due_time: int = None,
         auto_task: bool = None,
+        must_start_immediately: bool = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # search param
@@ -500,6 +509,8 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             default_progress (float, optional): Target task default_progress. Defaults to None.
             due_time (int, optional): Target task due_time. Defaults to None.
             auto_task (bool, optional): Target task auto_task. Defaults to None.
+            must_start_immediately (bool, optional): Target task
+                must_start_immediately. Defaults to None.
             fixing_allocating_worker_id_set (set[str], optional): Target task fixing_allocating_worker_id_set. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Target task fixing_allocating_facility_id_set. Defaults to None.
             est (float, optional): Target task est. Defaults to None.
@@ -568,6 +579,14 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             task_set = set(filter(lambda task: task.due_time == due_time, task_set))
         if auto_task is not None:
             task_set = set(filter(lambda task: task.auto_task == auto_task, task_set))
+        if must_start_immediately is not None:
+            task_set = set(
+                filter(
+                    lambda task: task.must_start_immediately
+                    == must_start_immediately,
+                    task_set,
+                )
+            )
         if fixing_allocating_worker_id_set is not None:
             task_set = set(
                 filter(
