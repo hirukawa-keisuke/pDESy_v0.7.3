@@ -252,7 +252,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
         due_time=None,
         auto_task=False,
         must_start_immediately=False,
-        parallel_group_id=None,
+        sync: dict[str, str] = None,
         fixing_allocating_worker_id_set=None,
         fixing_allocating_facility_id_set=None,
         # Basic variables
@@ -271,6 +271,8 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
         # Advanced variables for customized simulation
         additional_task_flag=False,
         actual_work_amount=None,
+        has_started: bool = None,
+        work_completed: bool = None,
     ):
         """Create a new BaseTask instance and add it to the targeted tasks.
 
@@ -293,9 +295,9 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             must_start_immediately (bool, optional): If True, allocation must
                 succeed in the task's first eligible simulation step. Defaults
                 to False.
-            parallel_group_id (str, optional): Workflow-scoped identifier for
-                tasks that must start in the same simulation step. Defaults to
-                None.
+            sync (dict[str, str], optional): Workflow-scoped "start" and/or
+                "finish" synchronization group IDs, each a nonblank string.
+                Defaults to None, meaning no synchronization.
             fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
             est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -311,6 +313,10 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             additional_work_amount (float, optional): Advanced parameter. Defaults to None.
             additional_task_flag (bool, optional): Advanced variable. Defaults to False.
             actual_work_amount (float, optional): Advanced variable. Default to None -> default_work_amount*(1.0-default_progress)
+            has_started (bool, optional): Whether this task has ever started.
+                Defaults to inference from its current state and state records.
+            work_completed (bool, optional): Whether its own work is complete.
+                Defaults to inference from started state and remaining work.
 
         Returns:
             BaseTask: Created BaseTask instance.
@@ -332,7 +338,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             due_time=due_time,
             auto_task=auto_task,
             must_start_immediately=must_start_immediately,
-            parallel_group_id=parallel_group_id,
+            sync=sync,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
@@ -351,6 +357,8 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             # Advanced variables for customized simulation
             additional_task_flag=additional_task_flag,
             actual_work_amount=actual_work_amount,
+            has_started=has_started,
+            work_completed=work_completed,
         )
         self.add_targeted_task(task)
         return task

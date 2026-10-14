@@ -152,7 +152,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         due_time: float = None,
         auto_task: bool = False,
         must_start_immediately: bool = False,
-        parallel_group_id: str = None,
+        sync: dict[str, str] = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # Basic variables
@@ -173,6 +173,8 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         # Advanced variables for customized simulation
         additional_task_flag: bool = False,
         actual_work_amount: float = None,
+        has_started: bool = None,
+        work_completed: bool = None,
     ):
         """
         Create a BaseTask instance and add it to this workflow.
@@ -196,9 +198,9 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             must_start_immediately (bool, optional): If True, allocation must
                 succeed in the task's first eligible simulation step. Defaults
                 to False.
-            parallel_group_id (str, optional): Workflow-scoped identifier for
-                tasks that must start in the same simulation step. Defaults to
-                None.
+            sync (dict[str, str], optional): Workflow-scoped "start" and/or
+                "finish" synchronization group IDs, each a nonblank string.
+                Defaults to None, meaning no synchronization.
             fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
             est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -214,6 +216,10 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             additional_work_amount (float, optional): Advanced parameter. Defaults to None.
             additional_task_flag (bool, optional): Advanced variable. Defaults to False.
             actual_work_amount (float, optional): Advanced variable. Default to None -> default_work_amount*(1.0-default_progress)
+            has_started (bool, optional): Whether this task has ever started.
+                Defaults to inference from its current state and state records.
+            work_completed (bool, optional): Whether its own work is complete.
+                Defaults to inference from started state and remaining work.
 
         Returns:
             BaseTask: The created task.
@@ -235,7 +241,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             due_time=due_time,
             auto_task=auto_task,
             must_start_immediately=must_start_immediately,
-            parallel_group_id=parallel_group_id,
+            sync=sync,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
@@ -254,6 +260,8 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             # Advanced variables for customized simulation
             additional_task_flag=additional_task_flag,
             actual_work_amount=actual_work_amount,
+            has_started=has_started,
+            work_completed=work_completed,
         )
         self.add_task(task)
         return task
@@ -281,12 +289,22 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
 
         Args:
             json_data (dict): JSON data.
+
+        Raises:
+            ValueError: Legacy parallel_group_id is present. Migrate it to
+                sync={"start": <group ID>} before loading.
         """
         self.name = json_data["name"]
         self.ID = json_data["ID"]
         self.task_set = set()
         j_list = json_data["task_set"]
         for j in j_list:
+            if j.get("parallel_group_id") is not None:
+                raise ValueError(
+                    f"Task {j.get('name')!r} [{j.get('ID')}] in workflow "
+                    f"{self.name!r} [{self.ID}] uses obsolete parallel_group_id; "
+                    "migrate it to sync={'start': <group ID>} before loading"
+                )
             if j["type"] == "BaseTask":
                 self.task_set.add(
                     BaseTask(
@@ -310,7 +328,10 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         must_start_immediately=j.get(
                             "must_start_immediately", j.get("mandatory", False)
                         ),
-                        parallel_group_id=j.get("parallel_group_id"),
+                        sync=j.get("sync"),
+                        has_started=j.get("has_started"),
+                        work_completed=j.get("work_completed"),
+                        parent_workflow_id=self.ID,
                         fixing_allocating_worker_id_set=(
                             set(j["fixing_allocating_worker_id_set"])
                             if j["fixing_allocating_worker_id_set"] is not None
@@ -356,7 +377,8 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                             "work_amount_progress_of_unit_step_time"
                         ],
                         input_task_id_dependency_set=set(
-                            j["input_task_id_dependency_set"]
+                            (id, BaseTaskDependency(dependency))
+                            for id, dependency in j["input_task_id_dependency_set"]
                         ),
                         allocated_team_id_set=set(j["allocated_team_id_set"]),
                         allocated_workplace_id_set=set(j["allocated_workplace_id_set"]),
@@ -368,12 +390,19 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                         must_start_immediately=j.get(
                             "must_start_immediately", j.get("mandatory", False)
                         ),
-                        parallel_group_id=j.get("parallel_group_id"),
-                        fixing_allocating_worker_id_set=set(
-                            j["fixing_allocating_worker_id_set"]
+                        sync=j.get("sync"),
+                        has_started=j.get("has_started"),
+                        work_completed=j.get("work_completed"),
+                        parent_workflow_id=self.ID,
+                        fixing_allocating_worker_id_set=(
+                            set(j["fixing_allocating_worker_id_set"])
+                            if j["fixing_allocating_worker_id_set"] is not None
+                            else None
                         ),
-                        fixing_allocating_facility_id_set=set(
-                            j["fixing_allocating_facility_id_set"]
+                        fixing_allocating_facility_id_set=(
+                            set(j["fixing_allocating_facility_id_set"])
+                            if j["fixing_allocating_facility_id_set"] is not None
+                            else None
                         ),
                         # Basic variables
                         est=j["est"],
@@ -398,6 +427,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                 )
 
         self.critical_path_length = json_data["critical_path_length"]
+        self.__invalidate_graph_cache()
 
     def extract_none_task_set(self, target_time_list: list[int]):
         """
@@ -485,7 +515,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
         due_time: int = None,
         auto_task: bool = None,
         must_start_immediately: bool = None,
-        parallel_group_id: str = None,
+        sync: dict[str, str] = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # search param
@@ -519,8 +549,8 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             auto_task (bool, optional): Target task auto_task. Defaults to None.
             must_start_immediately (bool, optional): Target task
                 must_start_immediately. Defaults to None.
-            parallel_group_id (str, optional): Target task parallel_group_id.
-                Defaults to None.
+            sync (dict[str, str], optional): Exact synchronization mapping to
+                match. Use {} for unsynchronized tasks. Defaults to None.
             fixing_allocating_worker_id_set (set[str], optional): Target task fixing_allocating_worker_id_set. Defaults to None.
             fixing_allocating_facility_id_set (set[str], optional): Target task fixing_allocating_facility_id_set. Defaults to None.
             est (float, optional): Target task est. Defaults to None.
@@ -597,10 +627,11 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
                     task_set,
                 )
             )
-        if parallel_group_id is not None:
+        if sync is not None:
+            sync = BaseTask._validate_sync(sync)
             task_set = set(
                 filter(
-                    lambda task: task.parallel_group_id == parallel_group_id,
+                    lambda task: task.sync == sync,
                     task_set,
                 )
             )
@@ -670,6 +701,7 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
             state_info (bool, optional): Whether to initialize state information. Defaults to True.
             log_info (bool, optional): Whether to initialize log information. Defaults to True.
         """
+        self.__invalidate_graph_cache()
         for task in self.task_set:
             task.initialize(state_info=state_info, log_info=log_info)
             if task.parent_workflow_id is None:
@@ -737,6 +769,25 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
 
         for task in self.task_set:
             for input_task_id, dep in task.input_task_id_dependency_set:
+                predecessor = task_by_id.get(input_task_id)
+                if predecessor is None:
+                    # PERT is local to this workflow. Runtime dependencies may
+                    # also refer to tasks in another workflow.
+                    continue
+                event = (
+                    "start"
+                    if dep == BaseTaskDependency.SS
+                    else "finish" if dep == BaseTaskDependency.FF else None
+                )
+                if (
+                    event is not None
+                    and task.sync.get(event) is not None
+                    and task.parent_workflow_id == predecessor.parent_workflow_id
+                    and task.sync[event] == predecessor.sync.get(event)
+                ):
+                    # The group's atomic event satisfies this edge. Keep the
+                    # original dependency on the task for runtime and display.
+                    continue
                 input_id_to_output_tasks.setdefault(input_task_id, []).append(
                     (task, dep)
                 )
@@ -837,12 +888,9 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
     ):
         for task in self.task_set:
             task.est = time
-            task.eft = time
+            task.eft = time + task.remaining_work_amount
 
         for task in sorted_tasks:
-            if len(task.input_task_id_dependency_set) == 0:
-                task.est = time
-                task.eft = time + task.remaining_work_amount
             for next_task, dependency in input_id_to_output_tasks.get(task.ID, []):
                 if dependency == BaseTaskDependency.FS:
                     est = task.eft
@@ -874,24 +922,27 @@ class BaseWorkflow(object, metaclass=abc.ABCMeta):
 
         task_id_map = {task.ID: task for task in self.task_set}
         tasks_with_outputs = {
-            task_id_map[input_task_id]
-            for task in self.task_set
-            for (input_task_id, _) in task.input_task_id_dependency_set
-            if input_task_id in task_id_map
+            task_id_map[input_task_id] for input_task_id in input_id_to_output_tasks
         }
         output_task_set = set(self.task_set) - tasks_with_outputs
 
-        self.critical_path_length = max(task.eft for task in output_task_set)
+        self.critical_path_length = max(
+            (task.eft for task in output_task_set), default=0.0
+        )
 
         for task in output_task_set:
             task.lft = self.critical_path_length
             task.lst = task.lft - task.remaining_work_amount
 
+        effective_inputs = {}
+        for previous_id, outputs in input_id_to_output_tasks.items():
+            for task, dependency in outputs:
+                effective_inputs.setdefault(task.ID, []).append(
+                    (task_id_map[previous_id], dependency)
+                )
+
         for task in reversed(sorted_tasks):
-            for prev_task_id, dependency in task.input_task_id_dependency_set:
-                prev_task = task_id_map.get(prev_task_id)
-                if prev_task is None:
-                    continue
+            for prev_task, dependency in effective_inputs.get(task.ID, []):
 
                 # Update lft, lst according to dependency type
                 if dependency == BaseTaskDependency.FS:

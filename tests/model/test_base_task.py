@@ -22,6 +22,7 @@ def test_init():
     assert task.allocated_team_id_set == set()
     assert task.allocated_workplace_id_set == set()
     assert task.target_component_id is None
+    assert task.parallel_group_id is None
     assert task.default_progress == 0.0
     assert task.fixing_allocating_worker_id_set is None
     assert task.fixing_allocating_facility_id_set is None
@@ -58,6 +59,14 @@ def test_init():
     assert tb.state == BaseTaskState.FINISHED
     assert tb.allocated_worker_facility_id_tuple_set_record_list == [{(w.ID, None)}]
     assert tb.additional_task_flag is True
+
+
+def test_parallel_group_id_is_exported():
+    """Parallel group membership is preserved in task JSON data."""
+    task = BaseTask("task", parallel_group_id="parallel-1")
+
+    assert task.parallel_group_id == "parallel-1"
+    assert task.export_dict_json_data()["parallel_group_id"] == "parallel-1"
 
 
 def test_str():

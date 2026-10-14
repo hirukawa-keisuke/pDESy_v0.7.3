@@ -50,7 +50,7 @@ class BaseSubProjectTask(BaseTask):
         due_time: float = None,
         auto_task: bool = True,
         must_start_immediately: bool = False,
-        parallel_group_id: str = None,
+        sync: dict[str, str] = None,
         fixing_allocating_worker_id_set: set = None,
         fixing_allocating_facility_id_set: set = None,
         # Basic variables
@@ -69,6 +69,8 @@ class BaseSubProjectTask(BaseTask):
         # Advanced variables for customized simulation
         additional_task_flag: bool = False,
         actual_work_amount: float = None,
+        has_started: bool = None,
+        work_completed: bool = None,
     ):
         """Initializes a BaseSubProjectTask.
 
@@ -95,8 +97,8 @@ class BaseSubProjectTask(BaseTask):
             auto_task (bool, optional): Whether the task is automatic.
             must_start_immediately (bool, optional): Whether allocation must
                 succeed in the first eligible simulation step.
-            parallel_group_id (str, optional): Workflow-scoped identifier for
-                tasks that must start in the same simulation step.
+            sync (dict[str, str], optional): Workflow-scoped "start" and/or
+                "finish" synchronization group IDs, each a nonblank string.
             fixing_allocating_worker_id_set (set, optional): Set of fixed allocating worker IDs.
             fixing_allocating_facility_id_set (set, optional): Set of fixed allocating facility IDs.
             est (float, optional): Earliest start time.
@@ -112,6 +114,10 @@ class BaseSubProjectTask(BaseTask):
             additional_work_amount (float, optional): Additional work amount for customized simulation.
             additional_task_flag (bool, optional): Additional task flag for customized simulation.
             actual_work_amount (float, optional): Actual work amount for customized simulation.
+            has_started (bool, optional): Whether this task has ever started.
+                Defaults to inference from its current state and state records.
+            work_completed (bool, optional): Whether its own work is complete.
+                Defaults to inference from started state and remaining work.
         """
         self.file_path = file_path
         self.unit_timedelta = (
@@ -139,7 +145,7 @@ class BaseSubProjectTask(BaseTask):
             due_time=due_time,
             auto_task=auto_task,
             must_start_immediately=must_start_immediately,
-            parallel_group_id=parallel_group_id,
+            sync=sync,
             fixing_allocating_worker_id_set=fixing_allocating_worker_id_set,
             fixing_allocating_facility_id_set=fixing_allocating_facility_id_set,
             # Basic variables
@@ -158,6 +164,8 @@ class BaseSubProjectTask(BaseTask):
             # Advanced variables for customized simulation
             additional_task_flag=additional_task_flag,
             actual_work_amount=actual_work_amount,
+            has_started=has_started,
+            work_completed=work_completed,
         )
 
     def set_all_attributes_from_json(

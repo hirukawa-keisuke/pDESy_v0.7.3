@@ -82,6 +82,26 @@ def fixture_sf_workflow():
     return BaseWorkflow(task_set={task1, task2, task3})
 
 
+def test_parallel_group_id_json_round_trip():
+    """Workflow JSON preserves parallel groups and accepts older task data."""
+    workflow = BaseWorkflow()
+    grouped_task = workflow.create_task(
+        "grouped", parallel_group_id="parallel-1"
+    )
+    json_data = workflow.export_dict_json_data()
+
+    loaded_workflow = BaseWorkflow()
+    loaded_workflow.read_json_data(json_data)
+    loaded_task = next(iter(loaded_workflow.task_set))
+
+    assert loaded_task.ID == grouped_task.ID
+    assert loaded_task.parallel_group_id == "parallel-1"
+
+    del json_data["task_set"][0]["parallel_group_id"]
+    loaded_workflow.read_json_data(json_data)
+    assert next(iter(loaded_workflow.task_set)).parallel_group_id is None
+
+
 def test_reverse_dependencies(dummy_workflow):
     """Test reversing dependencies in a workflow.
 

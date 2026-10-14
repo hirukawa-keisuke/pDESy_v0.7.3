@@ -374,7 +374,7 @@ class BaseTeam(object, metaclass=abc.ABCMeta):
                 ],
                 cost_record_list=w["cost_record_list"],
                 assigned_task_facility_id_tuple_set=set(
-                    w["assigned_task_facility_id_tuple_set"]
+                    tuple(pair) for pair in w["assigned_task_facility_id_tuple_set"]
                 ),
                 assigned_task_facility_id_tuple_set_record_list=w[
                     "assigned_task_facility_id_tuple_set_record_list"

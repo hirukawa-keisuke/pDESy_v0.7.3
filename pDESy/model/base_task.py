@@ -77,12 +77,13 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         default_progress (float, optional): Progress before starting simulation (0.0 ~ 1.0). Defaults to None -> 0.0.
         due_time (int, optional): Due time. Defaults to None -> int(-1).
         auto_task (bool, optional): If True, this task is performed automatically even if there are no allocated workers. Defaults to False.
-        must_start_immediately (bool, optional): If True, the task must acquire
-            resources in the same simulation step in which it becomes ready.
-            Defaults to False.
-        parallel_group_id (str, optional): Tasks with the same non-None value in
-            the same workflow are allocated atomically and start in the same
-            simulation step. Defaults to None.
+        must_start_immediately (bool, optional): If True, resource allocation
+            must succeed in the first eligible simulation step, after start
+            dependencies and all start-group members are ready. Defaults to False.
+        sync (dict[str, str], optional): Workflow-scoped synchronization groups.
+            Keys are "start" and/or "finish"; values are nonblank string IDs.
+            Start groups begin together and finish groups finish together.
+            Defaults to None, meaning no synchronization.
         fixing_allocating_worker_id_set (set[str], optional): Allocating worker ID set for fixing allocation in simulation. Defaults to None.
         fixing_allocating_facility_id_set (set[str], optional): Allocating facility ID set for fixing allocation in simulation. Defaults to None.
         est (float, optional): Earliest start time of CPM. This will be updated step by step. Defaults to 0.0.
@@ -98,6 +99,11 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         additional_work_amount (float, optional): Advanced parameter. Defaults to None.
         additional_task_flag (bool, optional): Advanced variable. Defaults to False.
         actual_work_amount (float, optional): Advanced variable. Default to None -> default_work_amount*(1.0-default_progress)
+        has_started (bool, optional): Whether this task has ever started.
+            Defaults to inference from its current state and state records.
+        work_completed (bool, optional): Whether its own work is complete,
+            independently of final synchronized completion. Defaults to
+            inference from started state and remaining work.
     """
 
     def __init__(
@@ -120,7 +126,7 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         due_time: int = int(-1),
         auto_task: bool = False,
         must_start_immediately: bool = False,
-        parallel_group_id: str = None,
+        sync: dict[str, str] = None,
         fixing_allocating_worker_id_set: set[str] = None,
         fixing_allocating_facility_id_set: set[str] = None,
         # Basic variables
@@ -141,6 +147,8 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         # Advanced variables for customized simulation
         additional_task_flag: bool = False,
         actual_work_amount: float = None,
+        has_started: bool = None,
+        work_completed: bool = None,
     ):
         """init."""
         # ----
@@ -198,9 +206,7 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         self.due_time = due_time or int(-1)
         self.auto_task = auto_task if auto_task is not False else False
         self.must_start_immediately = bool(must_start_immediately)
-        self.parallel_group_id = (
-            str(parallel_group_id) if parallel_group_id is not None else None
-        )
+        self.sync = self._validate_sync(sync)
         self.fixing_allocating_worker_id_set = fixing_allocating_worker_id_set or None
         self.fixing_allocating_facility_id_set = (
             fixing_allocating_facility_id_set or None
@@ -223,8 +229,25 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         self.remaining_work_amount_record_list = remaining_work_amount_record_list or []
         self.state = state or BaseTaskState.NONE
         self.state_record_list = state_record_list or []
+        started_states = (
+            BaseTaskState.WORKING,
+            BaseTaskState.WORKING_ADDITIONALLY,
+            BaseTaskState.FINISHED,
+        )
+        self.has_started = (
+            self.state in started_states
+            or any(record in started_states for record in self.state_record_list)
+            if has_started is None
+            else bool(has_started)
+        )
+        self.work_completed = (
+            self.state == BaseTaskState.FINISHED
+            or (self.has_started and self.remaining_work_amount <= 1e-10)
+            if work_completed is None
+            else bool(work_completed)
+        )
         self.allocated_worker_facility_id_tuple_set = (
-            frozenset(allocated_worker_facility_id_tuple_set)
+            frozenset(tuple(pair) for pair in allocated_worker_facility_id_tuple_set)
             if allocated_worker_facility_id_tuple_set is not None
             else frozenset()
         )
@@ -240,6 +263,24 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         self.actual_work_amount = self.default_work_amount * (
             1.0 - self.default_progress
         )
+
+    @staticmethod
+    def _validate_sync(sync: dict[str, str] | None) -> dict[str, str]:
+        """Validate and copy workflow-scoped synchronization group IDs."""
+        if sync is None:
+            return {}
+        if not isinstance(sync, dict):
+            raise TypeError("sync must be a dictionary or None")
+        for event, group_id in sync.items():
+            if event not in ("start", "finish"):
+                raise ValueError(
+                    f"Unknown sync key {event!r}; expected 'start' or 'finish'"
+                )
+            if not isinstance(group_id, str):
+                raise TypeError(f"sync[{event!r}] must be a nonblank string")
+            if not group_id.strip():
+                raise ValueError(f"sync[{event!r}] must be a nonblank string")
+        return dict(sync)
 
     def __str__(self):
         """Return the name of BaseTask.
@@ -279,7 +320,9 @@ class BaseTask(object, metaclass=abc.ABCMeta):
             due_time=self.due_time,
             auto_task=self.auto_task,
             must_start_immediately=self.must_start_immediately,
-            parallel_group_id=self.parallel_group_id,
+            sync=dict(self.sync),
+            has_started=self.has_started,
+            work_completed=self.work_completed,
             fixing_allocating_worker_id_set=(
                 list(self.fixing_allocating_worker_id_set)
                 if self.fixing_allocating_worker_id_set is not None
@@ -413,6 +456,8 @@ class BaseTask(object, metaclass=abc.ABCMeta):
             - `lft`
             - `remaining_work_amount`
             - `state`
+            - `has_started`
+            - `work_completed`
             - `allocated_worker_facility_id_tuple_set`
             - `additional_task_flag`
             - `actual_work_amount`
@@ -436,19 +481,33 @@ class BaseTask(object, metaclass=abc.ABCMeta):
                 1.0 - self.default_progress
             )
             self.state = BaseTaskState.NONE
+            self.has_started = False
+            self.work_completed = False
             self.allocated_worker_facility_id_tuple_set = frozenset()
             self.additional_task_flag = False
             self.actual_work_amount = self.default_work_amount * (
                 1.0 - self.default_progress
             )
+            if self.default_progress >= (1.00 - error_tol):
+                self.state = BaseTaskState.FINISHED
+                self.has_started = True
+                self.work_completed = True
+                self.remaining_work_amount = 0.0
+        else:
+            # Preserve execution facts even when continuation clears its logs.
+            started_states = (
+                BaseTaskState.WORKING,
+                BaseTaskState.WORKING_ADDITIONALLY,
+                BaseTaskState.FINISHED,
+            )
+            self.has_started = self.has_started or self.state in started_states
+            self.work_completed = self.work_completed or (
+                self.has_started and self.remaining_work_amount <= error_tol
+            )
         if log_info:
             self.remaining_work_amount_record_list = []
             self.state_record_list = []
             self.allocated_worker_facility_id_tuple_set_record_list = []
-
-        if state_info and log_info:
-            if self.default_progress >= (1.00 - error_tol):
-                self.state = BaseTaskState.FINISHED
 
     def set_alloc_pairs(self, pairs_iterable):
         """

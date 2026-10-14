@@ -4,6 +4,7 @@
 
 import datetime
 import itertools
+import heapq
 import json
 import sys
 from typing import Optional
@@ -609,8 +610,11 @@ class BaseProject(object, metaclass=ABCMeta):
         self.__initialize_child_instance_set_id_instance_dict()
 
         # product should be initialized after initializing workflow
+        self.__initialize_sync_groups(state_info=state_info)
         for workflow in self.workflow_set:
             workflow.initialize(state_info=state_info, log_info=log_info)
+        self.__reset_start_tracking()
+        for workflow in self.workflow_set:
             self.check_state_workflow(workflow, BaseTaskState.READY)
         for product in self.product_set:
             product.initialize(state_info=state_info, log_info=log_info)
@@ -666,6 +670,17 @@ class BaseProject(object, metaclass=ABCMeta):
         """
         Simulate this BaseProject.
 
+        SS dependencies constrain actual first starts: a successor waits until
+        its predecessor has started or is committed to start in the same step.
+        A predecessor's later interruption does not reset this condition.
+        READY alone does not satisfy SS or trigger an immediate-start deadline.
+
+        Workflow-scoped sync start groups acquire resources atomically, including
+        their automatic members. Finish groups retain completed work and resources
+        until every member can finish; absence and preemption can still release
+        resources. Group memberships are indexed at initialization and must not
+        change during a run. Resuming already started tasks needs no new start sync.
+
         Args:
             task_priority_rule (TaskPriorityRule, optional):
                 Task priority rule for simulation. Defaults to TaskPriorityRule.TSLACK.
@@ -706,23 +721,7 @@ class BaseProject(object, metaclass=ABCMeta):
 
         self.initialize(state_info=initialize_state_info, log_info=initialize_log_info)
 
-        # Parallel-group synchronization is required only for the first start.
-        # Reconstruct the set when continuing an existing simulation state.
-        self._started_parallel_group_key_set = set()
-        for key, tasks in self.__create_parallel_group_map().items():
-            if any(
-                task.state
-                in (
-                    BaseTaskState.WORKING,
-                    BaseTaskState.WORKING_ADDITIONALLY,
-                    BaseTaskState.FINISHED,
-                )
-                or BaseTaskState.WORKING in task.state_record_list
-                or BaseTaskState.WORKING_ADDITIONALLY in task.state_record_list
-                or BaseTaskState.FINISHED in task.state_record_list
-                for task in tasks
-            ):
-                self._started_parallel_group_key_set.add(key)
+        self._simulation_error_tol = error_tol
 
         self.simulation_mode = SimulationMode.FORWARD
 
@@ -816,29 +815,37 @@ class BaseProject(object, metaclass=ABCMeta):
                                         facility.state = BaseFacilityState.FREE
                 # =================================================================
 
-                # 2. Allocate free workers to READY tasks
-                if working:
-                    failed_immediate_tasks = self.__allocate(
-                        task_priority_rule=task_priority_rule,
-                    )
-                    if failed_immediate_tasks:
-                        self.status = BaseProjectStatus.FINISHED_FAILURE
-                        names = ", ".join(task.name for task in failed_immediate_tasks)
-                        warnings.warn(
-                            "Task(s) required to start immediately could not be "
-                            f"allocated at step {self.time}: {names}"
+                # Resolve starts and SF-triggered finishes at this boundary.
+                # Usually one pass; a new finish can release FS successors now.
+                while True:
+                    if working:
+                        failed_immediate_tasks = self.__allocate(
+                            task_priority_rule=task_priority_rule,
                         )
-                        if pbar is not None:
-                            pbar.n = self.time
-                            pbar.refresh()
-                            pbar.set_description("Immediate start failed")
-                        return
+                        if failed_immediate_tasks:
+                            self._ss_planned_task_ids.clear()
+                            self._planned_start_sync_group_keys.clear()
+                            self.status = BaseProjectStatus.FINISHED_FAILURE
+                            names = ", ".join(task.name for task in failed_immediate_tasks)
+                            warnings.warn(
+                                "Task(s) required to start immediately could not be "
+                                f"allocated at step {self.time}: {names}"
+                            )
+                            if pbar is not None:
+                                pbar.n = self.time
+                                pbar.refresh()
+                                pbar.set_description("Immediate start failed")
+                            return
+                    else:
+                        self.__plan_auto_starts()
 
-                # Update state of task newly allocated workers and facilities (READY -> WORKING)
-                for workflow in self.workflow_set:
-                    self.check_state_workflow(workflow, BaseTaskState.WORKING)
+                    for workflow in self.workflow_set:
+                        self.check_state_workflow(workflow, BaseTaskState.WORKING)
+                    if not self.__check_finished_tasks(update_work_completion=False):
+                        break
+                    self.__update()
+
                 for product in self.product_set:
-                    # product should be checked after checking workflow state
                     for component in product.component_set:
                         self.check_state_component(component)
 
@@ -1072,7 +1079,14 @@ class BaseProject(object, metaclass=ABCMeta):
     def __perform_task(
         self, task: BaseTask, seed=None, increase_component_error: float = 1.0
     ):
+        if task.work_completed:
+            return
         if task.state == BaseTaskState.WORKING:
+            task.has_started = True
+            if task.remaining_work_amount <= getattr(self, "_simulation_error_tol", 1e-10):
+                task.remaining_work_amount = 0.0
+                task.work_completed = True
+                return
             work_amount_progress = 0.0
             no_error_probability = 1.0
             if task.auto_task:
@@ -1113,6 +1127,9 @@ class BaseProject(object, metaclass=ABCMeta):
             task.remaining_work_amount = (
                 task.remaining_work_amount - work_amount_progress
             )
+            if task.remaining_work_amount <= getattr(self, "_simulation_error_tol", 1e-10):
+                task.remaining_work_amount = 0.0
+                task.work_completed = True
 
             if task.target_component_id is not None:
                 target_component = self.component_dict.get(
@@ -1326,8 +1343,7 @@ class BaseProject(object, metaclass=ABCMeta):
                 self.cost_record_list[standby_step] += cost_delta
 
     def __update(self):
-        for workflow in self.workflow_set:
-            self.check_state_workflow(workflow, BaseTaskState.FINISHED)
+        self.__check_finished_tasks()
         for product in self.product_set:
             # product should be checked after checking workflow state
             for component in product.component_set:
@@ -1390,22 +1406,75 @@ class BaseProject(object, metaclass=ABCMeta):
             cur = self.workplace_dict.get(cur.parent_workplace_id, None)
 
     @staticmethod
-    def __parallel_group_key(task: BaseTask):
-        """Return the workflow-scoped parallel group key for a task."""
-        if task.parallel_group_id is None:
+    def __sync_group_key(task: BaseTask, event: str):
+        """Identify an event group within its owning workflow."""
+        group_id = task.sync.get(event)
+        if group_id is None:
             return None
-        return (task.parent_workflow_id, task.parallel_group_id)
+        return (task.parent_workflow_id, event, group_id)
 
-    def __create_parallel_group_map(self):
-        """Collect parallel-group members across the project."""
-        group_map = {}
+    def __start_sync_group_key(self, task: BaseTask):
+        return self.__sync_group_key(task, "start")
+
+    def __initialize_sync_groups(self, state_info: bool = False):
+        """Index fixed memberships once per run and reject direct conflicts."""
+        for workflow in self.workflow_set:
+            for task in workflow.task_set:
+                task.parent_workflow_id = workflow.ID
+        self._sync_group_map = {}
         for task in self.task_set:
-            key = self.__parallel_group_key(task)
-            if key is not None:
-                group_map.setdefault(key, []).append(task)
-        for tasks in group_map.values():
-            tasks.sort(key=lambda task: (task.name, task.ID))
-        return group_map
+            for event in ("start", "finish"):
+                key = self.__sync_group_key(task, event)
+                if key is not None:
+                    self._sync_group_map.setdefault(key, []).append(task)
+        for members in self._sync_group_map.values():
+            members.sort(key=lambda task: (task.name, task.ID))
+        self._start_sync_group_map = {
+            key: members for key, members in self._sync_group_map.items()
+            if key[1] == "start"
+        }
+        self._finish_sync_units = [
+            members for key, members in self._sync_group_map.items()
+            if key[1] == "finish"
+        ] + [[task] for task in self.task_set if "finish" not in task.sync]
+        for task in self.task_set:
+            for predecessor_id, dependency in task.input_task_id_dependency_set:
+                if dependency != BaseTaskDependency.FS:
+                    continue
+                predecessor = self.task_dict.get(predecessor_id)
+                if predecessor is None:
+                    continue
+                if predecessor.default_progress >= 1.0 - 1e-10 or (
+                    not state_info and predecessor.state == BaseTaskState.FINISHED
+                ):
+                    # Existing initial completion satisfies FS before new starts.
+                    continue
+                for event in ("start", "finish"):
+                    key = self.__sync_group_key(task, event)
+                    if key is not None and key == self.__sync_group_key(predecessor, event):
+                        raise ValueError(
+                            f"FS dependency {predecessor.name!r} ({predecessor.ID}) -> "
+                            f"{task.name!r} ({task.ID}) conflicts with sync {event!r} "
+                            f"group {key[2]!r} in workflow {key[0]!r}"
+                        )
+
+    def __reset_start_tracking(self):
+        """Restore first-start facts independently of retained log records."""
+        # Initially complete tasks keep their existing FINISHED semantics;
+        # synchronize the first starts of the remaining members.
+        self._start_sync_group_map = {
+            key: [task for task in members if not (
+                task.state == BaseTaskState.FINISHED
+                and task.default_progress >= 1.0 - 1e-10
+            )]
+            for key, members in self._start_sync_group_map.items()
+        }
+        self._started_start_group_keys = {
+            key for key, members in self._start_sync_group_map.items()
+            if any(self.__task_has_started(task) for task in members)
+        }
+        self._planned_start_sync_group_keys = set()
+        self._ss_planned_task_ids = set()
 
     def __place_task_component_for_allocation(
         self,
@@ -1482,7 +1551,7 @@ class BaseProject(object, metaclass=ABCMeta):
             self.set_component_on_workplace(component, workplace)
             return
 
-    def __get_parallel_allocation_candidates(
+    def __get_sync_allocation_candidates(
         self,
         task: BaseTask,
         free_worker_list: list[BaseWorker],
@@ -1575,7 +1644,7 @@ class BaseProject(object, metaclass=ABCMeta):
         )
         return [(worker, None) for worker in allocating_workers]
 
-    def __plan_parallel_group_allocation(
+    def __plan_start_sync_group_allocation(
         self,
         group_tasks: list[BaseTask],
         free_worker_list: list[BaseWorker],
@@ -1585,7 +1654,7 @@ class BaseProject(object, metaclass=ABCMeta):
         for task in group_tasks:
             if task.auto_task or task.allocated_worker_facility_id_tuple_set:
                 continue
-            candidates = self.__get_parallel_allocation_candidates(
+            candidates = self.__get_sync_allocation_candidates(
                 task, free_worker_list
             )
             if not candidates:
@@ -1660,8 +1729,8 @@ class BaseProject(object, metaclass=ABCMeta):
 
         return plan if search(0) else None
 
-    def __commit_parallel_group_allocation(self, plan):
-        """Commit a previously validated parallel-group allocation plan."""
+    def __commit_start_sync_group_allocation(self, plan):
+        """Commit a previously validated start-sync group allocation plan."""
         for task, worker, facility in plan:
             facility_id = facility.ID if facility is not None else None
             self.__fill_worker_short_free_gap_as_standby(worker)
@@ -1683,10 +1752,10 @@ class BaseProject(object, metaclass=ABCMeta):
                 unallocated.append(task)
         return unallocated
 
-    def __preempt_non_immediate_allocations(self):
+    def __preempt_non_immediate_allocations(self, protected_task_ids=()):
         """Release resources from interruptible tasks and return them to READY."""
         for task in self.task_set:
-            if not task.must_start_immediately:
+            if not task.must_start_immediately and task.ID not in protected_task_ids:
                 # すでに割り当てがある場合（WORKING、あるいはREADYで割り当て済み）
                 if len(task.allocated_worker_facility_id_tuple_set) > 0:
                     
@@ -1715,53 +1784,139 @@ class BaseProject(object, metaclass=ABCMeta):
                     if len(task.allocated_worker_facility_id_tuple_set) == 0:
                         task.state = BaseTaskState.READY
 
+    @staticmethod
+    def __task_has_started(task: BaseTask):
+        return task.has_started or task.state in (
+            BaseTaskState.WORKING, BaseTaskState.WORKING_ADDITIONALLY,
+            BaseTaskState.FINISHED,
+        )
+
+    def __ss_satisfied(self, task: BaseTask, simultaneous_ids=()):
+        """SS gates first starts using actual or atomically planned starts."""
+        if self.__task_has_started(task):
+            return True
+        planned = getattr(self, "_ss_planned_task_ids", set())
+        for predecessor_id, dependency in task.input_task_id_dependency_set:
+            if dependency != BaseTaskDependency.SS:
+                continue
+            predecessor = self.task_dict.get(predecessor_id)
+            if predecessor is None or not (
+                self.__task_has_started(predecessor)
+                or predecessor_id in planned
+                or predecessor_id in simultaneous_ids
+            ):
+                return False
+        return True
+
+    def __iter_ss_allocation_tasks(self, tasks, pending_keys, group_map):
+        """Yield eligible start units in priority order without repeated scans.
+
+        The heap retains each unit's original priority position. Only successful
+        allocation plans wake its SS successors, so a blocked higher-priority
+        successor is retried before other eligible units when its inputs start.
+        All indexes are local to this allocation pass: resource availability,
+        preemption and standby history are evaluated by the allocator as before.
+        """
+        self._ss_planned_task_ids = set()
+        units = {}
+        unresolved = {}
+        successors = {}
+        eligible = []
+        seen_groups = set()
+        for priority, task in enumerate(tasks):
+            key = self.__start_sync_group_key(task)
+            is_group = key in pending_keys
+            if is_group:
+                if key in seen_groups:
+                    continue
+                seen_groups.add(key)
+                members = group_map[key]
+                if not all(member.state == BaseTaskState.READY for member in members):
+                    continue
+            else:
+                members = [task]
+            simultaneous_ids = {member.ID for member in members} if is_group else set()
+            missing = set()
+            for member in members:
+                if self.__task_has_started(member):
+                    continue
+                for predecessor_id, dependency in member.input_task_id_dependency_set:
+                    if dependency != BaseTaskDependency.SS or predecessor_id in simultaneous_ids:
+                        continue
+                    predecessor = self.task_dict.get(predecessor_id)
+                    if predecessor is None or not self.__task_has_started(predecessor):
+                        missing.add(predecessor_id)
+            units[priority] = (task, key, members)
+            unresolved[priority] = missing
+            for predecessor_id in missing:
+                successors.setdefault(predecessor_id, []).append(priority)
+            if not missing:
+                heapq.heappush(eligible, priority)
+
+        while eligible:
+            priority = heapq.heappop(eligible)
+            task, key, members = units[priority]
+            yield task
+            allocated = all(
+                member.auto_task or member.allocated_worker_facility_id_tuple_set
+                for member in members
+            )
+            if not allocated or (
+                key in pending_keys and key not in self._planned_start_sync_group_keys
+            ):
+                continue
+            for member in members:
+                if self.__task_has_started(member):
+                    continue
+                self._ss_planned_task_ids.add(member.ID)
+                for successor in successors.pop(member.ID, []):
+                    unresolved[successor].remove(member.ID)
+                    if not unresolved[successor]:
+                        heapq.heappush(eligible, successor)
+
+    def __plan_auto_starts(self):
+        """Plan resource-free starts during a project absence step."""
+        self._planned_start_sync_group_keys = set()
+        pending_keys = set(self._start_sync_group_map) - self._started_start_group_keys
+        tasks = [task for task in self.task_set
+                 if task.auto_task and not task.work_completed
+                 and task.state == BaseTaskState.READY]
+        for task in self.__iter_ss_allocation_tasks(
+            tasks, pending_keys, self._start_sync_group_map
+        ):
+            key = self.__start_sync_group_key(task)
+            if key in pending_keys and all(
+                member.auto_task for member in self._start_sync_group_map[key]
+            ):
+                self._planned_start_sync_group_keys.add(key)
+
     def __allocate(
         self,
         task_priority_rule: TaskPriorityRuleMode = TaskPriorityRuleMode.TSLACK,
     ):
-        parallel_group_map = self.__create_parallel_group_map()
-        pending_parallel_group_keys = {
+        self._planned_start_sync_group_keys = set()
+        start_sync_group_map = self._start_sync_group_map
+        pending_start_sync_group_keys = {
             key
-            for key in parallel_group_map
+            for key in start_sync_group_map
             if key
-            not in getattr(self, "_started_parallel_group_key_set", set())
+            not in getattr(self, "_started_start_group_keys", set())
         }
-        ready_parallel_group_keys = {
+        ready_start_sync_group_keys = {
             key
-            for key, tasks in parallel_group_map.items()
-            if key in pending_parallel_group_keys
+            for key, tasks in start_sync_group_map.items()
+            if key in pending_start_sync_group_keys
             and all(task.state == BaseTaskState.READY for task in tasks)
         }
-
-        # A mixed group is immediate when any member is immediate. The deadline
-        # is the step in which the final member becomes READY.
-        immediate_ready_tasks = []
-        for task in self.task_set:
-            if task.state != BaseTaskState.READY:
-                continue
-            group_key = self.__parallel_group_key(task)
-            if group_key is None or group_key not in pending_parallel_group_keys:
-                if task.must_start_immediately:
-                    immediate_ready_tasks.append(task)
-                continue
-            if group_key not in ready_parallel_group_keys:
-                continue
-            group_tasks = parallel_group_map[group_key]
-            if any(member.must_start_immediately for member in group_tasks):
-                immediate_ready_tasks.extend(group_tasks)
-
-        immediate_ready_tasks = list(set(immediate_ready_tasks))
-        if immediate_ready_tasks:
-            self.__preempt_non_immediate_allocations()
-
 
         # =================================================================
         # 1. 割り当て対象のタスクと、FREEなワーカーの取得
         # =================================================================
         ready_and_working_task_list = list(
             filter(
-                lambda task: task.state == BaseTaskState.READY
-                or task.state == BaseTaskState.WORKING,
+                lambda task: not task.work_completed and task.state in (
+                    BaseTaskState.READY, BaseTaskState.WORKING
+                ),
                 self.task_set,
             )
         )
@@ -1772,7 +1927,7 @@ class BaseProject(object, metaclass=ABCMeta):
             )
         )
 
-        # 事前にプリエンプションしたことで、ここで取得される free_worker_list が増えている
+        # Refresh this list if an eligible immediate task preempts existing work.
         free_worker_list = list(
             filter(lambda worker: worker.state == BaseWorkerState.FREE, worker_list)
         )
@@ -1793,38 +1948,64 @@ class BaseProject(object, metaclass=ABCMeta):
 
 
         # =================================================================
-        # 3. 実際の割り当て処理（ループは1回のみ！）
+        # 3. Allocate eligible tasks, resolving same-step SS starts first.
         # =================================================================
         target_workplace_id_set = {wp.ID for wp in self.workplace_set}
-        processed_parallel_group_keys = set()
+        processed_start_sync_group_keys = set()
 
-        for task in ready_and_working_task_list:
-            parallel_group_key = self.__parallel_group_key(task)
-            if (
-                parallel_group_key is not None
-                and parallel_group_key in pending_parallel_group_keys
+        immediate_ready_tasks = []
+        preempted = False
+        for task in self.__iter_ss_allocation_tasks(
+            ready_and_working_task_list, pending_start_sync_group_keys,
+            start_sync_group_map,
+        ):
+            key = self.__start_sync_group_key(task)
+            members = (
+                start_sync_group_map[key]
+                if key in pending_start_sync_group_keys else [task]
+            )
+            if any(
+                member.must_start_immediately and member.state == BaseTaskState.READY
+                for member in members
             ):
-                if parallel_group_key in processed_parallel_group_keys:
+                immediate_ready_tasks.extend(members)
+                if not preempted:
+                    self.__preempt_non_immediate_allocations(self._ss_planned_task_ids)
+                    free_worker_list = [
+                        worker for worker in worker_list
+                        if worker.state == BaseWorkerState.FREE
+                        and not any(
+                            task_id in self._ss_planned_task_ids
+                            for task_id, _ in worker.assigned_task_facility_id_tuple_set
+                        )
+                    ]
+                    preempted = True
+            start_sync_group_key = self.__start_sync_group_key(task)
+            if (
+                start_sync_group_key is not None
+                and start_sync_group_key in pending_start_sync_group_keys
+            ):
+                if start_sync_group_key in processed_start_sync_group_keys:
                     continue
-                processed_parallel_group_keys.add(parallel_group_key)
+                processed_start_sync_group_keys.add(start_sync_group_key)
 
-                if parallel_group_key not in ready_parallel_group_keys:
+                if start_sync_group_key not in ready_start_sync_group_keys:
                     continue
 
-                parallel_group_tasks = parallel_group_map[parallel_group_key]
-                for group_task in parallel_group_tasks:
+                start_sync_group_tasks = start_sync_group_map[start_sync_group_key]
+                for group_task in start_sync_group_tasks:
                     self.__place_task_component_for_allocation(
                         group_task, target_workplace_id_set
                     )
 
-                allocation_plan = self.__plan_parallel_group_allocation(
-                    parallel_group_tasks, free_worker_list
+                allocation_plan = self.__plan_start_sync_group_allocation(
+                    start_sync_group_tasks, free_worker_list
                 )
                 if allocation_plan is None:
                     continue
 
-                self.__commit_parallel_group_allocation(allocation_plan)
-                self._started_parallel_group_key_set.add(parallel_group_key)
+                self.__commit_start_sync_group_allocation(allocation_plan)
+                self._planned_start_sync_group_keys.add(start_sync_group_key)
                 allocated_worker_ids = {
                     worker.ID for _, worker, _ in allocation_plan
                 }
@@ -2002,7 +2183,7 @@ class BaseProject(object, metaclass=ABCMeta):
         # =================================================================
         # The result is checked before this simulation step performs or records
         # any work, so an immediate-start requirement is decided in the same step
-        # in which the task becomes READY.
+        # in which its SS predecessors have started or will start this step.
         return self.__find_unallocated_immediate_tasks(immediate_ready_tasks)
 
     def check_state_workflow(self, workflow: BaseWorkflow, state: BaseTaskState):
@@ -2022,56 +2203,19 @@ class BaseProject(object, metaclass=ABCMeta):
             self.__check_finished_workflow(workflow)
 
     def __check_ready_workflow(self, workflow: BaseWorkflow):
-        NONE = BaseTaskState.NONE
-        READY = BaseTaskState.READY
-        WORKING = BaseTaskState.WORKING
-        FINISHED = BaseTaskState.FINISHED
-
-        task_dict = self.task_dict
-
-        max_iter = len(workflow.task_set)
-        for _ in range(max_iter):
-            changed = False
-
-            for task in workflow.task_set:
-                if task.state is not NONE:
-                    continue
-
-                deps = task.input_task_id_dependency_set
-                if not deps:
-                    task.state = READY
-                    changed = True
-                    continue
-
-                ready = True
-                for input_task_id, dep in deps:
-                    inp = task_dict.get(input_task_id)
-                    if inp is None:
-                        ready = False
-                        break
-
-                    if dep == BaseTaskDependency.FS:
-                        if inp.state is not FINISHED:
-                            ready = False
-                            break
-
-                    elif dep == BaseTaskDependency.SS:
-                        # READY synchronization: predecessor must be READY or higher
-                        if inp.state not in (READY, WORKING, FINISHED):
-                            ready = False
-                            break
-
-                    elif dep == BaseTaskDependency.SF:
-                        pass
-                    elif dep == BaseTaskDependency.FF:
-                        pass
-
-                if ready:
-                    task.state = READY
-                    changed = True
-
-            if not changed:
-                break
+        # SS gates actual starts in allocation, including internal group edges.
+        # Only FS can prevent a task from becoming a candidate here.
+        for task in workflow.task_set:
+            if task.state != BaseTaskState.NONE:
+                continue
+            if all(
+                predecessor_id in self.task_dict and (
+                    dependency != BaseTaskDependency.FS
+                    or self.task_dict[predecessor_id].state == BaseTaskState.FINISHED
+                )
+                for predecessor_id, dependency in task.input_task_id_dependency_set
+            ):
+                task.state = BaseTaskState.READY
 
     def __check_working_workflow(self, workflow: BaseWorkflow):
         READY = BaseTaskState.READY
@@ -2090,11 +2234,23 @@ class BaseProject(object, metaclass=ABCMeta):
 
         for task in workflow.task_set:
             s = task.state
-
-            if s is READY and (
-                task.auto_task or task.allocated_worker_facility_id_tuple_set
+            group_key = self.__start_sync_group_key(task)
+            if (
+                s is READY
+                and group_key is not None
+                and group_key not in getattr(self, "_started_start_group_keys", set())
+                and group_key not in getattr(self, "_planned_start_sync_group_keys", set())
             ):
+                # Auto members must wait for the group's allocation commit too.
+                continue
+
+            if s is READY and not task.work_completed and (
+                task.auto_task or task.allocated_worker_facility_id_tuple_set
+            ) and self.__ss_satisfied(task):
                 task.state = WORKING
+                task.has_started = True
+                if group_key is not None:
+                    self._started_start_group_keys.add(group_key)
                 for (
                     worker_id,
                     facility_id,
@@ -2124,66 +2280,90 @@ class BaseProject(object, metaclass=ABCMeta):
     def __check_finished_workflow(
         self, workflow: BaseWorkflow, error_tol: float = 1e-10
     ):
-        WORKING = BaseTaskState.WORKING
-        FINISHED = BaseTaskState.FINISHED
+        return self.__check_finished_tasks(workflow, error_tol)
 
-        W_FREE = BaseWorkerState.FREE
-        F_FREE = BaseFacilityState.FREE
+    def __check_finished_tasks(
+        self, workflow: BaseWorkflow = None, error_tol: float = None,
+        update_work_completion: bool = True,
+    ) -> bool:
+        """Finish eligible units atomically, resolving FF chains in this step.
 
-        task_dict = self.task_dict
-        worker_dict = self.worker_dict
-        facility_dict = self.facility_dict
+        Own work completion survives interruptions and needs no new allocation.
+        FF edges within a finish group are satisfied by its atomic transition;
+        external FF and all SF edges still constrain that transition.
+        """
+        if not hasattr(self, "_finish_sync_units"):
+            self.__initialize_sync_groups()
+        if error_tol is None:
+            error_tol = getattr(self, "_simulation_error_tol", 1e-10)
+        units = self._finish_sync_units
+        if workflow is not None:
+            units = [members for members in units if members[0] in workflow.task_set]
+        for members in units:
+            for task in members:
+                if self.__task_has_started(task):
+                    task.has_started = True
+                    if update_work_completion and task.remaining_work_amount <= error_tol:
+                        task.remaining_work_amount = 0.0
+                        task.work_completed = True
 
-        for task in workflow.task_set:
-            if not (
-                task.state is WORKING and task.remaining_work_amount < 0.0 + error_tol
-            ):
+        any_finished = False
+        while True:
+            changed = False
+            for members in units:
+                unfinished = [task for task in members if task.state != BaseTaskState.FINISHED]
+                if not unfinished or not all(
+                    task.has_started and task.work_completed for task in unfinished
+                ):
+                    continue
+                member_ids = {task.ID for task in members}
+                if not all(
+                    self.__finish_dependencies_satisfied(
+                        task, member_ids if "finish" in task.sync else set()
+                    )
+                    for task in unfinished
+                ):
+                    continue
+                # Set every state before releasing shared resource assignments.
+                for task in unfinished:
+                    task.state = BaseTaskState.FINISHED
+                    task.remaining_work_amount = 0.0
+                for task in unfinished:
+                    self.__release_finished_task_resources(task)
+                changed = True
+                any_finished = True
+            if not changed:
+                return any_finished
+
+    def __finish_dependencies_satisfied(self, task: BaseTask, member_ids: set[str]):
+        for predecessor_id, dependency in task.input_task_id_dependency_set:
+            if dependency not in (BaseTaskDependency.FF, BaseTaskDependency.SF):
                 continue
+            predecessor = self.task_dict.get(predecessor_id)
+            if predecessor is None:
+                return False
+            if dependency == BaseTaskDependency.SF:
+                if not self.__task_has_started(predecessor):
+                    return False
+            elif predecessor_id not in member_ids and predecessor.state != BaseTaskState.FINISHED:
+                return False
+        return True
 
-            finished_ok = True
-            for input_task_id, dep in task.input_task_id_dependency_set:
-                inp = task_dict.get(input_task_id)
-                if inp is None:
-                    finished_ok = False
-                if dep == BaseTaskDependency.SF:
-                    if inp.state not in (BaseTaskState.WORKING, BaseTaskState.FINISHED):
-                        finished_ok = False
-                        break
-                elif dep == BaseTaskDependency.FF:
-                    if inp.state is not BaseTaskState.FINISHED:
-                        finished_ok = False
-                        break
-
-            if not finished_ok:
-                continue
-
-            task.state = FINISHED
-            task.remaining_work_amount = 0.0
-
-            for worker_id, facility_id in task.allocated_worker_facility_id_tuple_set:
-                w = worker_dict.get(worker_id)
-                if w:
-                    if w.assigned_task_facility_id_tuple_set and all(
-                        (task_dict.get(tid, None) is not None)
-                        and (task_dict[tid].state is FINISHED)
-                        for (tid, _fid) in w.assigned_task_facility_id_tuple_set
-                    ):
-                        w.state = W_FREE
-                    w.remove_assigned_pair((task.ID, facility_id))
-
-                if task.need_facility:
-                    f = facility_dict.get(facility_id)
-                    if f:
-                        if f.assigned_task_worker_id_tuple_set and all(
-                            (task_dict.get(tid, None) is not None)
-                            and (task_dict[tid].state is FINISHED)
-                            for (tid, _wid) in f.assigned_task_worker_id_tuple_set
-                        ):
-                            f.state = F_FREE
-                        f.remove_assigned_pair((task.ID, worker_id))
-
-            # Consistently use frozenset() here as well
-            task.allocated_worker_facility_id_tuple_set = frozenset()
+    def __release_finished_task_resources(self, task: BaseTask):
+        for worker_id, facility_id in task.allocated_worker_facility_id_tuple_set:
+            worker = self.worker_dict.get(worker_id)
+            if worker is not None:
+                worker.remove_assigned_pair((task.ID, facility_id))
+                if (not worker.assigned_task_facility_id_tuple_set
+                        and worker.state != BaseWorkerState.ABSENCE):
+                    worker.state = BaseWorkerState.FREE
+            facility = self.facility_dict.get(facility_id)
+            if facility is not None:
+                facility.remove_assigned_pair((task.ID, worker_id))
+                if (not facility.assigned_task_worker_id_tuple_set
+                        and facility.state != BaseFacilityState.ABSENCE):
+                    facility.state = BaseFacilityState.FREE
+        task.allocated_worker_facility_id_tuple_set = frozenset()
 
     def can_put_component_to_workplace(
         self,
@@ -2224,7 +2404,7 @@ class BaseProject(object, metaclass=ABCMeta):
         Returns:
             bool: True if the target task can be assigned the specified resources, False otherwise.
         """
-        if task.state == BaseTaskState.NONE:
+        if task.work_completed or task.state == BaseTaskState.NONE:
             return False
         elif task.state == BaseTaskState.FINISHED:
             return False
@@ -3397,7 +3577,7 @@ class BaseProject(object, metaclass=ABCMeta):
                     workplace.ID
                     for workplace in self.workplace_set
                     if workplace.ID == c.placed_workplace_id
-                ]
+                ][0]
                 if c.placed_workplace_id is not None
                 else None
             )
@@ -3422,11 +3602,9 @@ class BaseProject(object, metaclass=ABCMeta):
                 else None
             )
 
-            t.allocated_worker_facility_id_tuple_set = {
-                (w_id, f_id)
-                for (w_id, f_id) in t.allocated_worker_facility_id_tuple_set
-                if (w_id, f_id) in t.allocated_worker_facility_id_tuple_set
-            }
+            t.allocated_worker_facility_id_tuple_set = frozenset(
+                t.allocated_worker_facility_id_tuple_set
+            )
 
         # 2-3. team
         for x in self.team_set:
@@ -3438,9 +3616,9 @@ class BaseProject(object, metaclass=ABCMeta):
             )
             for w in x.worker_set:
                 w.assigned_task_facility_id_tuple_set = {
-                    task.ID
-                    for task in all_task_set
-                    if task.ID in w.assigned_task_facility_id_tuple_set
+                    (task_id, facility_id)
+                    for task_id, facility_id in w.assigned_task_facility_id_tuple_set
+                    if task_id in all_task_id_set
                 }
 
         # 2-4. workplace
@@ -3462,9 +3640,9 @@ class BaseProject(object, metaclass=ABCMeta):
             }
             for f in x.facility_set:
                 f.assigned_task_worker_id_tuple_set = {
-                    task.ID
-                    for task in all_task_set
-                    if task.ID in f.assigned_task_worker_id_tuple_set
+                    (task_id, worker_id)
+                    for task_id, worker_id in f.assigned_task_worker_id_tuple_set
+                    if task_id in all_task_id_set
                 }
 
         self.__initialize_child_instance_set_id_instance_dict()
@@ -3516,6 +3694,18 @@ class BaseProject(object, metaclass=ABCMeta):
         with open(file_path, "r", encoding=encoding) as pdes_json:
             json_data = json.load(pdes_json)
             data = json_data["pDESy"]
+            for node in data:
+                if node["type"] != "BaseWorkflow":
+                    continue
+                for task_json in node["task_set"]:
+                    if task_json.get("parallel_group_id") is not None:
+                        raise ValueError(
+                            f"Task {task_json.get('name')!r} ({task_json.get('ID')}) "
+                            f"in workflow {node.get('ID')!r} uses obsolete "
+                            "parallel_group_id; migrate it to sync={'start': "
+                            "<group ID>} before loading"
+                        )
+                    BaseTask._validate_sync(task_json.get("sync"))
             project_json = list(
                 filter(lambda node: node["type"] == "BaseProject", data)
             )[0]
@@ -3569,9 +3759,17 @@ class BaseProject(object, metaclass=ABCMeta):
                 task.state_record_list.extend(
                     [BaseTaskState(num) for num in j["state_record_list"]],
                 )
-                task.allocated_worker_facility_id_tuple_set = j[
-                    "allocated_worker_facility_id_tuple_set"
-                ]
+                task.has_started = j.get("has_started", task.has_started or any(
+                    state in (
+                        BaseTaskState.WORKING, BaseTaskState.WORKING_ADDITIONALLY,
+                        BaseTaskState.FINISHED,
+                    ) for state in [task.state] + task.state_record_list
+                ))
+                task.work_completed = j.get("work_completed", task.has_started
+                    and task.remaining_work_amount <= 1e-10)
+                task.allocated_worker_facility_id_tuple_set = frozenset(
+                    tuple(pair) for pair in j["allocated_worker_facility_id_tuple_set"]
+                )
                 task.allocated_worker_facility_id_tuple_set_record_list.extend(
                     j["allocated_worker_facility_id_tuple_set_record_list"]
                 )

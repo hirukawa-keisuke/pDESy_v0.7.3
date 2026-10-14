@@ -438,6 +438,177 @@ def test_str():
     print(BaseProject())
 
 
+def _create_immediate_start_project(immediate_tasks):
+    """Create a one-worker project targeting the supplied tasks."""
+    project = BaseProject()
+    workflow = BaseWorkflow(task_set=set(immediate_tasks))
+    project.add_workflow(workflow)
+    team = BaseTeam("team")
+    team.update_targeted_task_set(set(immediate_tasks))
+    worker = BaseWorker("worker", team_id=team.ID)
+    worker.workamount_skill_mean_map = {task.name: 1.0 for task in immediate_tasks}
+    team.add_worker(worker)
+    project.add_team(team)
+    return project, worker
+
+
+def test_must_start_immediately_preempts_interruptible_task():
+    """An immediate task takes an occupied worker in its first READY step."""
+    predecessor = BaseTask("predecessor", default_work_amount=1, auto_task=True)
+    interruptible = BaseTask("interruptible", default_work_amount=3)
+    immediate = BaseTask(
+        "immediate", default_work_amount=1, must_start_immediately=True
+    )
+    immediate.add_input_task(predecessor)
+    project, worker = _create_immediate_start_project(
+        [predecessor, interruptible, immediate]
+    )
+
+    project.simulate(max_time=10)
+
+    assert project.status == BaseProjectStatus.FINISHED_SUCCESS
+    assert interruptible.allocated_worker_facility_id_tuple_set_record_list[0] == {
+        (worker.ID, None)
+    }
+    assert immediate.allocated_worker_facility_id_tuple_set_record_list[1] == {
+        (worker.ID, None)
+    }
+    assert interruptible.allocated_worker_facility_id_tuple_set_record_list[1] == set()
+
+
+def test_must_start_immediately_failure_is_scenario_result():
+    """Resource shortage fails the scenario without raising RuntimeError."""
+    tasks = [
+        BaseTask(f"immediate-{index}", must_start_immediately=True)
+        for index in range(2)
+    ]
+    project, _ = _create_immediate_start_project(tasks)
+
+    with pytest.warns(UserWarning, match="could not be allocated at step 0"):
+        project.simulate(max_time=10)
+
+    assert project.status == BaseProjectStatus.FINISHED_FAILURE
+    assert project.time == 0
+    assert project.cost_record_list == []
+
+
+def _create_parallel_start_project(tasks, worker_skill_names):
+    """Create a project whose workers have the supplied task-name skills."""
+    project = BaseProject()
+    workflow = BaseWorkflow(task_set=set(tasks))
+    project.add_workflow(workflow)
+    team = BaseTeam("team")
+    team.update_targeted_task_set(set(tasks))
+    workers = []
+    for index, skill_names in enumerate(worker_skill_names):
+        worker = BaseWorker(
+            f"worker-{index}",
+            team_id=team.ID,
+            assignment_priority=index,
+        )
+        worker.workamount_skill_mean_map = {
+            name: 1.0 for name in skill_names
+        }
+        team.add_worker(worker)
+        workers.append(worker)
+    project.add_team(team)
+    return project, workers
+
+
+def test_parallel_group_starts_all_tasks_in_same_step():
+    """A parallel group starts atomically when every member is allocatable."""
+    task_a = BaseTask(
+        "parallel-a", default_work_amount=1, parallel_group_id="group"
+    )
+    task_b = BaseTask(
+        "parallel-b", default_work_amount=1, parallel_group_id="group"
+    )
+    project, _ = _create_parallel_start_project(
+        [task_a, task_b], [{task_a.name}, {task_b.name}]
+    )
+
+    project.simulate(max_time=10)
+
+    assert project.status == BaseProjectStatus.FINISHED_SUCCESS
+    assert task_a.state_record_list[0] == BaseTaskState.WORKING
+    assert task_b.state_record_list[0] == BaseTaskState.WORKING
+
+
+def test_parallel_group_does_not_partially_start():
+    """A normal group waits when only some members can be allocated."""
+    task_a = BaseTask(
+        "parallel-a", default_work_amount=1, parallel_group_id="group"
+    )
+    task_b = BaseTask(
+        "parallel-b", default_work_amount=1, parallel_group_id="group"
+    )
+    project, _ = _create_parallel_start_project(
+        [task_a, task_b], [{task_a.name, task_b.name}]
+    )
+
+    with pytest.warns(UserWarning, match="Time Over"):
+        project.simulate(max_time=1)
+
+    assert task_a.state_record_list == [BaseTaskState.READY]
+    assert task_b.state_record_list == [BaseTaskState.READY]
+    assert not task_a.allocated_worker_facility_id_tuple_set
+    assert not task_b.allocated_worker_facility_id_tuple_set
+
+
+def test_parallel_group_waits_until_every_member_is_ready():
+    """The group's start deadline is when its final member becomes READY."""
+    predecessor = BaseTask(
+        "predecessor", default_work_amount=1, auto_task=True
+    )
+    task_a = BaseTask(
+        "parallel-a", default_work_amount=1, parallel_group_id="group"
+    )
+    task_b = BaseTask(
+        "parallel-b", default_work_amount=1, parallel_group_id="group"
+    )
+    task_b.add_input_task(predecessor)
+    project, _ = _create_parallel_start_project(
+        [predecessor, task_a, task_b], [{task_a.name}, {task_b.name}]
+    )
+
+    project.simulate(max_time=10)
+
+    assert task_a.state_record_list[:2] == [
+        BaseTaskState.READY,
+        BaseTaskState.WORKING,
+    ]
+    assert task_b.state_record_list[:2] == [
+        BaseTaskState.NONE,
+        BaseTaskState.WORKING,
+    ]
+
+
+def test_parallel_group_is_immediate_when_any_member_is_immediate():
+    """A mixed group inherits immediate-start behavior from its true member."""
+    task_a = BaseTask(
+        "parallel-a",
+        parallel_group_id="group",
+        must_start_immediately=True,
+    )
+    task_b = BaseTask(
+        "parallel-b",
+        parallel_group_id="group",
+        must_start_immediately=False,
+    )
+    project, _ = _create_parallel_start_project(
+        [task_a, task_b], [{task_a.name, task_b.name}]
+    )
+
+    with pytest.warns(UserWarning, match="could not be allocated at step 0"):
+        project.simulate(max_time=10)
+
+    assert project.status == BaseProjectStatus.FINISHED_FAILURE
+    assert project.time == 0
+    assert project.cost_record_list == []
+    assert not task_a.allocated_worker_facility_id_tuple_set
+    assert not task_b.allocated_worker_facility_id_tuple_set
+
+
 def test_create_gantt_plotly(dummy_project, tmpdir):
     """Test creating a Gantt chart using Plotly.
 
