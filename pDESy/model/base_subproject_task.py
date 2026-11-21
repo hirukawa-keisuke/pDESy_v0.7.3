@@ -71,6 +71,7 @@ class BaseSubProjectTask(BaseTask):
         actual_work_amount: float = None,
         has_started: bool = None,
         work_completed: bool = None,
+        max_workers: int = 0,
     ):
         """Initializes a BaseSubProjectTask.
 
@@ -118,6 +119,9 @@ class BaseSubProjectTask(BaseTask):
                 Defaults to inference from its current state and state records.
             work_completed (bool, optional): Whether its own work is complete.
                 Defaults to inference from started state and remaining work.
+            max_workers (int, optional): Maximum number of distinct workers allocated
+                simultaneously, with or without facilities. Zero means no task-level
+                limit; this is not a minimum staffing requirement. Defaults to 0.
         """
         self.file_path = file_path
         self.unit_timedelta = (
@@ -166,6 +170,7 @@ class BaseSubProjectTask(BaseTask):
             actual_work_amount=actual_work_amount,
             has_started=has_started,
             work_completed=work_completed,
+            max_workers=max_workers,
         )
 
     def set_all_attributes_from_json(

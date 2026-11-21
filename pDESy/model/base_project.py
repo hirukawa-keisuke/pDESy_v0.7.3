@@ -2127,6 +2127,10 @@ class BaseProject(object, metaclass=ABCMeta):
                             # ---
 
                             for worker in allocating_workers:
+                                if not self.can_add_resources_to_task(
+                                    task, worker=worker, facility=facility
+                                ):
+                                    continue
                                 self.__fill_worker_short_free_gap_as_standby(worker)
                                 # --- 追加
                                 worker.activate(self.time)
@@ -2408,6 +2412,18 @@ class BaseProject(object, metaclass=ABCMeta):
             return False
         elif task.state == BaseTaskState.FINISHED:
             return False
+
+        # Count distinct workers currently assigned, independently of facilities.
+        if worker is not None and task.max_workers > 0:
+            allocated_worker_ids = {
+                worker_id
+                for worker_id, _ in task.allocated_worker_facility_id_tuple_set
+            }
+            if (
+                worker.ID not in allocated_worker_ids
+                and len(allocated_worker_ids) >= task.max_workers
+            ):
+                return False
 
         # True if none of the allocated resources have solo_working attribute True.
         for w_id, f_id in task.allocated_worker_facility_id_tuple_set:

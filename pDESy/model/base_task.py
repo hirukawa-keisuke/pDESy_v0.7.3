@@ -104,6 +104,9 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         work_completed (bool, optional): Whether its own work is complete,
             independently of final synchronized completion. Defaults to
             inference from started state and remaining work.
+        max_workers (int, optional): Maximum number of distinct workers allocated
+            simultaneously, with or without facilities. Zero means no task-level
+            limit; this is not a minimum staffing requirement. Defaults to 0.
     """
 
     def __init__(
@@ -149,8 +152,16 @@ class BaseTask(object, metaclass=abc.ABCMeta):
         actual_work_amount: float = None,
         has_started: bool = None,
         work_completed: bool = None,
+        max_workers: int = 0,
     ):
         """init."""
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int):
+            raise TypeError(
+                "max_workers must be a non-negative integer (bool is not allowed)"
+            )
+        if max_workers < 0:
+            raise ValueError("max_workers must be a non-negative integer")
+        self.max_workers = max_workers
         # ----
         # Constraint parameter on simulation
         # --
@@ -311,6 +322,7 @@ class BaseTask(object, metaclass=abc.ABCMeta):
             allocated_team_id_set=list(self.allocated_team_id_set),
             allocated_workplace_id_set=list(self.allocated_workplace_id_set),
             need_facility=self.need_facility,
+            max_workers=self.max_workers,
             target_component_id=(
                 self.target_component_id
                 if self.target_component_id is not None

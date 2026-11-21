@@ -273,6 +273,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
         actual_work_amount=None,
         has_started: bool = None,
         work_completed: bool = None,
+        max_workers: int = 0,
     ):
         """Create a new BaseTask instance and add it to the targeted tasks.
 
@@ -317,6 +318,9 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
                 Defaults to inference from its current state and state records.
             work_completed (bool, optional): Whether its own work is complete.
                 Defaults to inference from started state and remaining work.
+            max_workers (int, optional): Maximum number of distinct workers allocated
+                simultaneously, with or without facilities. Zero means no task-level
+                limit; this is not a minimum staffing requirement. Defaults to 0.
 
         Returns:
             BaseTask: Created BaseTask instance.
@@ -359,6 +363,7 @@ class BaseComponent(object, metaclass=abc.ABCMeta):
             actual_work_amount=actual_work_amount,
             has_started=has_started,
             work_completed=work_completed,
+            max_workers=max_workers,
         )
         self.add_targeted_task(task)
         return task
